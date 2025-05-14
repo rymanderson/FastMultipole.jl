@@ -59,7 +59,7 @@ end
 Base.getindex(system::SourcePanels, i, ::Strength) = system.strength[i]
 Base.getindex(system::SourcePanels, i, ::Vertex, i_v) = system.x[i][i_v]
 Base.getindex(system::SourcePanels, i, ::Position) = sum(system.x[i]) / 3
-function Base.getindex(system::SourcePanels, i, ::Normal)
+function Base.getindex(system::SourcePanels, i, ::FastMultipole.Normal)
     x1 = system[i,Vertex(),1]
     x2 = system[i,Vertex(),2]
     x3 = system[i,Vertex(),3]
@@ -129,7 +129,7 @@ end
 Base.getindex(system::DipolePanels, i, ::Strength) = system.strength[i]
 Base.getindex(system::DipolePanels, i, ::Vertex, i_v) = system.x[i][i_v]
 Base.getindex(system::DipolePanels, i, ::Position) = sum(system.x[i]) / 3
-function Base.getindex(system::DipolePanels, i, ::Normal)
+function Base.getindex(system::DipolePanels, i, ::FastMultipole.Normal)
     x1 = system[i,Vertex(),1]
     x2 = system[i,Vertex(),2]
     x3 = system[i,Vertex(),3]
@@ -199,7 +199,7 @@ end
 Base.getindex(system::VortexPanels, i, ::Strength) = system.strength[i]
 Base.getindex(system::VortexPanels, i, ::Vertex, i_v) = system.x[i][i_v]
 Base.getindex(system::VortexPanels, i, ::Position) = sum(system.x[i]) / 3
-function Base.getindex(system::VortexPanels, i, ::Normal)
+function Base.getindex(system::VortexPanels, i, ::FastMultipole.Normal)
     x1 = system[i,Vertex(),1]
     x2 = system[i,Vertex(),2]
     x3 = system[i,Vertex(),3]
@@ -764,7 +764,7 @@ system = SourcePanels(x, [q])
 
 xt = SVector{3}(0.2, 0.3, 5.7)
 
-normal = system[1,Normal()]
+normal = system[1,FastMultipole.Normal()]
 strength = system[1,Strength()]
 centroid = system[1,Position()]
 ϕ_check, v_check, g_check = induced(xt, vertices, normal, strength, centroid, Panel{Source}, DerivativesSwitch(true,true,true))
@@ -854,7 +854,7 @@ system = DipolePanels(x, [q])
 
 xt = SVector{3}(0.2, 0.3, 5.7)
 
-normal = system[1,Normal()]
+normal = system[1,FastMultipole.Normal()]
 strength = system[1,Strength()]
 centroid = system[1,Position()]
 ϕ_check, v_check, g_check = induced(xt, vertices, normal, SVector{1}(norm(strength)), centroid, Panel{Dipole}, DerivativesSwitch(true,true,true))
@@ -944,7 +944,7 @@ system = VortexPanels(x, [q])
 
 xt = SVector{3}(0.2, 0.3, 5.7)
 
-normal = system[1,Normal()]
+normal = system[1,FastMultipole.Normal()]
 strength = system[1,Strength()]
 centroid = system[1,Position()]
 #ϕ_check, v_check, g_check = induced(xt, vertices, normal, SVector{1}(norm(strength)), centroid, Panel{Vortex}, DerivativesSwitch(true,true,true))
