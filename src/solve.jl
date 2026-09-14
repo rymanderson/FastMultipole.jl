@@ -1042,7 +1042,8 @@ One Gauss-Seidel sweep over all source leaves.
 function gs_sweep!(strengths, self_matrices, leaf_lu_cache, right_hand_side,
                    nonself_matrices, old_influence_storage, source_tree,
                    target_tree, strengths_by_leaf, index_map, direct_list,
-                   targets_by_branch, solver, reverse_sweep::Bool)
+                   targets_by_branch, solver, reverse_sweep::Bool,
+                   diagnostics=nothing)
 
     if solver.sweep_order === :colored
 
@@ -1072,11 +1073,27 @@ function gs_sweep!(strengths, self_matrices, leaf_lu_cache, right_hand_side,
 
         for (i_leaf, i_branch) in enumerate(source_tree.leaf_index)
             leaf_strengths = view(strengths, strengths_by_leaf[i_leaf])
+            t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
             solve_leaf!(leaf_strengths, self_matrices, leaf_lu_cache, i_leaf)
-            length(direct_list) > 0 && update_nonself_influence!(
-                right_hand_side, strengths, nonself_matrices,
-                old_influence_storage, i_leaf, source_tree, target_tree,
-                strengths_by_leaf, index_map, direct_list, targets_by_branch)
+            diagnostics === nothing || (diagnostics[:leaf_solve_ns] += time_ns() - t_stage)
+            if length(direct_list) > 0
+                if diagnostics === nothing
+                    update_nonself_influence!(right_hand_side, strengths,
+                        nonself_matrices, old_influence_storage, i_leaf,
+                        source_tree, target_tree, strengths_by_leaf, index_map,
+                        direct_list, targets_by_branch)
+                else
+                    t_stage = time_ns()
+                    compute_nonself_products!(strengths, nonself_matrices,
+                        old_influence_storage, i_leaf, strengths_by_leaf)
+                    diagnostics[:nonself_product_ns] += time_ns() - t_stage
+                    t_stage = time_ns()
+                    scatter_nonself_influence!(right_hand_side, nonself_matrices,
+                        old_influence_storage, i_leaf, target_tree, index_map,
+                        direct_list, targets_by_branch)
+                    diagnostics[:scatter_ns] += time_ns() - t_stage
+                end
+            end
         end
 
     end
@@ -1094,8 +1111,19 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
     scalar_potential=false, gradient=true, hessian=false,
     max_iterations=10, inner_iterations=1, tolerance=1e-3,
     rlx=1.0, reverse_pass=false, verbose=true, final_update=true,
-    callback=nothing
+    callback=nothing, diagnostics=nothing
 ) where {TF,N}
+
+    solve_start_ns = diagnostics === nothing ? UInt64(0) : time_ns()
+    if diagnostics !== nothing
+        empty!(diagnostics)
+        for key in (:total_ns, :initialization_ns, :fmm_ns, :influence_mapping_ns,
+                    :residual_ns, :leaf_solve_ns, :nonself_product_ns,
+                    :scatter_ns, :remaining_iteration_ns, :final_update_ns,
+                    :outer_count, :sweep_count, :leaf_visit_count)
+            diagnostics[key] = UInt64(0)
+        end
+    end
 
     #--- refuse direction-carrying outputs on a transformed solver ---#
 
@@ -1141,6 +1169,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
     #--- external right-hand side based on current influence ---#
 
     # reset and update buffers
+    initialization_start_ns = diagnostics === nothing ? UInt64(0) : time_ns()
     target_influence_to_buffer!(target_buffers, target_systems, derivatives_switches, target_tree.sort_index_list)
 
     # run influence function on buffers
@@ -1165,6 +1194,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
     # add nonself influence to the right-hand side
     nonself_matrices.rhs .= zero(TF) # reset rhs
     update_nonself_influence!(right_hand_side, strengths, nonself_matrices, old_influence_storage, source_tree, target_tree, strengths_by_leaf, index_map, direct_list, targets_by_branch)
+    diagnostics === nothing || (diagnostics[:initialization_ns] += time_ns() - initialization_start_ns)
 
     #--- fast gauss seidel iterations ---#
 
@@ -1178,10 +1208,12 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
 
     # begin iterations
     for iteration in 1:max_iterations
+        diagnostics === nothing || (diagnostics[:outer_count] += 1)
 
         #--- farfield influence ---#
 
         # fmm call
+        t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
         reset!(target_buffers)
 
         fmm!(target_systems, target_tree, source_systems, source_tree, source_tree.leaf_size, m2l_list, empty_direct_list, derivatives_switches, interaction_list_method;
@@ -1195,16 +1227,21 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
             # silence_warnings=false,
             extra_farfield=solver.extra_farfield,
         )
+        diagnostics === nothing || (diagnostics[:fmm_ns] += time_ns() - t_stage)
 
         # move farfield influence to the right-hand side
+        t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
         reset!(extra_right_hand_side)
         influence!(extra_right_hand_side, influences_per_system, target_buffers, source_systems, source_buffers, source_tree, derivatives_switches)
         right_hand_side .+= extra_right_hand_side
+        diagnostics === nothing || (diagnostics[:influence_mapping_ns] += time_ns() - t_stage)
 
         #--- check residual ---#
 
         # note that `right_hand_side` now contains external, nonself, and farfield influence
+        t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
         mse = residual!(residual_vector, self_matrices, strengths, strengths_by_leaf)
+        diagnostics === nothing || (diagnostics[:residual_ns] += time_ns() - t_stage)
 
         # convergence-history hook: called once per outer iteration with the
         # exact residual the loop's tolerance check uses (max-abs, despite the
@@ -1228,26 +1265,36 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
 
         #--- nearfield influence and solve ---#
 
+        remaining_start_ns = diagnostics === nothing ? UInt64(0) : time_ns()
         strengths_old .= strengths
+        diagnostics === nothing || (diagnostics[:remaining_iteration_ns] += time_ns() - remaining_start_ns)
 
         for i_inner in 1:inner_iterations
+
+            if diagnostics !== nothing
+                diagnostics[:sweep_count] += 1
+                diagnostics[:leaf_visit_count] += length(source_tree.leaf_index)
+            end
 
             gs_sweep!(strengths, self_matrices, leaf_lu_cache, right_hand_side,
                 nonself_matrices, old_influence_storage, source_tree,
                 target_tree, strengths_by_leaf, index_map, direct_list,
-                targets_by_branch, solver, false)
+                targets_by_branch, solver, false, diagnostics)
 
             if reverse_pass
                 #--- reverse pass ---#
                 gs_sweep!(strengths, self_matrices, leaf_lu_cache,
                     right_hand_side, nonself_matrices, old_influence_storage,
                     source_tree, target_tree, strengths_by_leaf, index_map,
-                    direct_list, targets_by_branch, solver, true)
+                    direct_list, targets_by_branch, solver, true, diagnostics)
+                diagnostics === nothing || (diagnostics[:sweep_count] += 1)
+                diagnostics === nothing || (diagnostics[:leaf_visit_count] += length(source_tree.leaf_index))
             end
 
         end
 
         # get delta
+        remaining_start_ns = diagnostics === nothing ? UInt64(0) : time_ns()
         strengths_old .-= strengths
         strengths_old .*= strengths_old
         Δ = sqrt(maximum(strengths_old))
@@ -1259,6 +1306,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
         #--- restore right hand side to exclude farfield influence ---#
 
         right_hand_side .-= extra_right_hand_side
+        diagnostics === nothing || (diagnostics[:remaining_iteration_ns] += time_ns() - remaining_start_ns)
 
     end
 
@@ -1273,6 +1321,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
 
     # use new strengths to get the full influence (farfield was already computed)
     if final_update
+        t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
         fmm!(target_systems, target_tree, source_systems, source_tree, source_tree.leaf_size, m2l_list, full_direct_list, derivatives_switches, interaction_list_method;
                 expansion_order=source_tree.expansion_order, error_tolerance=nothing,
                 upward_pass=false, horizontal_pass=false, downward_pass=false, # just nearfield influence
@@ -1284,10 +1333,13 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
                 # silence_warnings=false,
                 extra_farfield=solver.extra_farfield
             )
+        diagnostics === nothing || (diagnostics[:final_update_ns] += time_ns() - t_stage)
     end
 
     # update source system strengths
     buffer_to_system_strength!(source_systems, source_tree)
+
+    diagnostics === nothing || (diagnostics[:total_ns] = time_ns() - solve_start_ns)
 
 end
 

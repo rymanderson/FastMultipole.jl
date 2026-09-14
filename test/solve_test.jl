@@ -442,8 +442,17 @@ FastMultipole.assert_shared_topology(fgs.target_tree, fgs.source_tree) # must no
 
 direct!(system; scalar_potential=true, gradient=false)
 system.potential[1, :] .*= -1.0 # invert external potential so FGS solves for strengths
-FastMultipole.solve!(system, fgs; scalar_potential=true, gradient=false, max_iterations=20, tolerance=1e-3)
+diagnostics = Dict{Symbol,UInt64}()
+FastMultipole.solve!(system, fgs; scalar_potential=true, gradient=false,
+    max_iterations=20, tolerance=1e-3, diagnostics)
 @test all(isfinite(b.strength) for b in system.bodies)
+@test diagnostics[:total_ns] > 0
+@test diagnostics[:outer_count] > 0
+@test diagnostics[:sweep_count] * length(fgs.source_tree.leaf_index) == diagnostics[:leaf_visit_count]
+@test sum(diagnostics[k] for k in (:initialization_ns, :fmm_ns,
+    :influence_mapping_ns, :residual_ns, :leaf_solve_ns,
+    :nonself_product_ns, :scatter_ns, :remaining_iteration_ns,
+    :final_update_ns)) <= diagnostics[:total_ns]
 
 end
 
