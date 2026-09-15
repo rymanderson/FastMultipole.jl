@@ -1111,7 +1111,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
     scalar_potential=false, gradient=true, hessian=false,
     max_iterations=10, inner_iterations=1, tolerance=1e-3,
     rlx=1.0, reverse_pass=false, verbose=true, final_update=true,
-    callback=nothing, diagnostics=nothing
+    callback=nothing, diagnostics=nothing, stage_observer=nothing
 ) where {TF,N}
 
     solve_start_ns = diagnostics === nothing ? UInt64(0) : time_ns()
@@ -1169,6 +1169,9 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
     #--- external right-hand side based on current influence ---#
 
     # reset and update buffers
+    # Optional coarse activity observations belong to separate diagnostic runs.
+    # They are deliberately outside stage timers and never enter leaf hot loops.
+    stage_observer === nothing || stage_observer(:initialization, :start)
     initialization_start_ns = diagnostics === nothing ? UInt64(0) : time_ns()
     target_influence_to_buffer!(target_buffers, target_systems, derivatives_switches, target_tree.sort_index_list)
 
@@ -1195,6 +1198,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
     nonself_matrices.rhs .= zero(TF) # reset rhs
     update_nonself_influence!(right_hand_side, strengths, nonself_matrices, old_influence_storage, source_tree, target_tree, strengths_by_leaf, index_map, direct_list, targets_by_branch)
     diagnostics === nothing || (diagnostics[:initialization_ns] += time_ns() - initialization_start_ns)
+    stage_observer === nothing || stage_observer(:initialization, :stop)
 
     #--- fast gauss seidel iterations ---#
 
@@ -1213,6 +1217,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
         #--- farfield influence ---#
 
         # fmm call
+        stage_observer === nothing || stage_observer(:fmm, :start)
         t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
         reset!(target_buffers)
 
@@ -1228,20 +1233,25 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
             extra_farfield=solver.extra_farfield,
         )
         diagnostics === nothing || (diagnostics[:fmm_ns] += time_ns() - t_stage)
+        stage_observer === nothing || stage_observer(:fmm, :stop)
 
         # move farfield influence to the right-hand side
+        stage_observer === nothing || stage_observer(:influence_mapping, :start)
         t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
         reset!(extra_right_hand_side)
         influence!(extra_right_hand_side, influences_per_system, target_buffers, source_systems, source_buffers, source_tree, derivatives_switches)
         right_hand_side .+= extra_right_hand_side
         diagnostics === nothing || (diagnostics[:influence_mapping_ns] += time_ns() - t_stage)
+        stage_observer === nothing || stage_observer(:influence_mapping, :stop)
 
         #--- check residual ---#
 
         # note that `right_hand_side` now contains external, nonself, and farfield influence
+        stage_observer === nothing || stage_observer(:residual, :start)
         t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
         mse = residual!(residual_vector, self_matrices, strengths, strengths_by_leaf)
         diagnostics === nothing || (diagnostics[:residual_ns] += time_ns() - t_stage)
+        stage_observer === nothing || stage_observer(:residual, :stop)
 
         # convergence-history hook: called once per outer iteration with the
         # exact residual the loop's tolerance check uses (max-abs, despite the
@@ -1265,6 +1275,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
 
         #--- nearfield influence and solve ---#
 
+        stage_observer === nothing || stage_observer(:nearfield_update, :start)
         remaining_start_ns = diagnostics === nothing ? UInt64(0) : time_ns()
         strengths_old .= strengths
         diagnostics === nothing || (diagnostics[:remaining_iteration_ns] += time_ns() - remaining_start_ns)
@@ -1307,6 +1318,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
 
         right_hand_side .-= extra_right_hand_side
         diagnostics === nothing || (diagnostics[:remaining_iteration_ns] += time_ns() - remaining_start_ns)
+        stage_observer === nothing || stage_observer(:nearfield_update, :stop)
 
     end
 
@@ -1321,6 +1333,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
 
     # use new strengths to get the full influence (farfield was already computed)
     if final_update
+        stage_observer === nothing || stage_observer(:final_update, :start)
         t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
         fmm!(target_systems, target_tree, source_systems, source_tree, source_tree.leaf_size, m2l_list, full_direct_list, derivatives_switches, interaction_list_method;
                 expansion_order=source_tree.expansion_order, error_tolerance=nothing,
@@ -1334,10 +1347,13 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
                 extra_farfield=solver.extra_farfield
             )
         diagnostics === nothing || (diagnostics[:final_update_ns] += time_ns() - t_stage)
+        stage_observer === nothing || stage_observer(:final_update, :stop)
     end
 
     # update source system strengths
+    stage_observer === nothing || stage_observer(:strength_copy, :start)
     buffer_to_system_strength!(source_systems, source_tree)
+    stage_observer === nothing || stage_observer(:strength_copy, :stop)
 
     diagnostics === nothing || (diagnostics[:total_ns] = time_ns() - solve_start_ns)
 
