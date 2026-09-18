@@ -1127,9 +1127,20 @@ struct FastGaussSeidel{TF,Nsys,TIL,TLC} <: AbstractSolver
     extra_farfield::Bool
     # colored-sweep mode (opt-in; changes the Gauss-Seidel iteration to
     # color-major leaf order — see `color_leaves` in solve.jl):
-    sweep_order::Symbol                   # :lexicographic (default) or :colored
+    sweep_order::Symbol                   # :lexicographic (default), :colored, or :chunked
     leaf_colors::Vector{Int}              # color id per leaf (empty when lexicographic)
     leaves_by_color::Vector{Vector{Int}}  # ascending leaf ids per color
+    # chunked-sweep mode (opt-in; Gauss-Seidel within contiguous leaf chunks,
+    # Jacobi across chunks via deferred cross-chunk scatter — see
+    # `build_chunk_map` in solve.jl). Empty for other orders.
+    chunks::Int                              # requested chunk count
+    chunk_ranges::Vector{UnitRange{Int}}     # contiguous leaf ranges tiling 1:n_leaves
+    # per-source-leaf scatter partition: (direct_list index, influence-buffer
+    # offset) pairs, ascending; a segment is intra only when ALL rows it
+    # writes lie inside the source leaf's own chunk (non-leaf target branches
+    # can span several leaves' rows)
+    scatter_intra::Vector{Vector{Tuple{Int,Int}}}
+    scatter_cross::Vector{Vector{Tuple{Int,Int}}}
     # set by transform_solver! (rigid-motion tree reuse): once true, solves
     # requesting gradient outputs refuse — the dense influence matrices embed
     # build-time gradient rows, which do not rotate with the body

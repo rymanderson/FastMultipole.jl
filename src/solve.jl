@@ -613,10 +613,12 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
     interaction_list_method=Barba(), shrink=true, recenter=false,
     derivatives_switches=DerivativesSwitch(true, true, false, target_systems),
     extra_farfield=false, cache_leaf_lu::Bool=true,
-    sweep_order::Symbol=:lexicographic
+    sweep_order::Symbol=:lexicographic, chunks::Int=64
 )
-    sweep_order in (:lexicographic, :colored) || throw(ArgumentError(
-        "sweep_order must be :lexicographic or :colored (got $(repr(sweep_order)))"))
+    sweep_order in (:lexicographic, :colored, :chunked) || throw(ArgumentError(
+        "sweep_order must be :lexicographic, :colored, or :chunked (got $(repr(sweep_order)))"))
+    chunks >= 1 || throw(ArgumentError(
+        "chunks must be a positive integer (got $chunks)"))
 
     #--- identical source and target trees ---#
 
@@ -730,6 +732,18 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
         leaves_by_color = Vector{Int}[]
     end
 
+    #--- chunked-sweep structures (opt-in; empty otherwise) ---#
+
+    if sweep_order === :chunked
+        chunk_ranges, scatter_intra, scatter_cross = build_chunk_map(chunks,
+            source_tree, self_matrices, nonself_matrices, sorted_list,
+            index_map, targets_by_branch)
+    else
+        chunk_ranges = UnitRange{Int}[]
+        scatter_intra = Vector{Tuple{Int,Int}}[]
+        scatter_cross = Vector{Tuple{Int,Int}}[]
+    end
+
     return FastGaussSeidel{TF,length(source_systems),typeof(interaction_list_method),typeof(leaf_lu_cache)}(
         self_matrices,
         leaf_lu_cache,
@@ -754,6 +768,10 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
         sweep_order,
         leaf_colors,
         leaves_by_color,
+        chunks,
+        chunk_ranges,
+        scatter_intra,
+        scatter_cross,
         Ref(false),
     )
 end
@@ -965,6 +983,129 @@ function scatter_nonself_influence!(right_hand_side, nonself_matrices::Matrices,
     return nothing
 end
 
+# Partial variant of `scatter_nonself_influence!` used by the :chunked sweep:
+# applies only the given (direct_list index, influence-buffer offset) segments
+# of leaf `i_leaf`'s already-computed old/new products. Offsets are
+# precomputed in `build_chunk_map` and equal the running `i_influence_start`
+# of the unsplit path, so the per-segment arithmetic (+old, -new, same views)
+# is identical — the split changes only when and by whom a segment is applied.
+function scatter_nonself_influence_partial!(right_hand_side, nonself_matrices::Matrices, old_influence_storage, i_leaf::Int, segments::Vector{Tuple{Int,Int}}, target_tree::Tree, direct_list::Vector{SVector{2,Int32}}, targets_by_branch::Vector{UnitRange{Int}})
+
+    isempty(segments) && return nothing
+
+    _, target_influence = get_matrix_vector(nonself_matrices, i_leaf)
+    m = length(target_influence)
+    rhs_offset = nonself_matrices.rhs_offsets[i_leaf]
+    old_influence = view(old_influence_storage, rhs_offset:rhs_offset + m - 1)
+
+    for (index, i_influence_start) in segments
+
+        # determine which target leaf
+        i_target, _ = direct_list[index]
+
+        # how many targets
+        n_targets = get_n_bodies(target_tree.branches[i_target].bodies_index)
+
+        # influence on this target leaf
+        this_influence = view(target_influence, i_influence_start:i_influence_start + n_targets - 1)
+        this_old_influence = view(old_influence, i_influence_start:i_influence_start + n_targets - 1)
+
+        # get influence at the appropriate target
+        this_rhs = view(right_hand_side, targets_by_branch[i_target])
+
+        # remove old influence from right-hand side
+        this_rhs .+= this_old_influence
+
+        # add influence to the right-hand side
+        this_rhs .-= this_influence
+    end
+    return nothing
+end
+
+"""
+    build_chunk_map(nchunks, source_tree, self_matrices, nonself_matrices, sorted_list, index_map, targets_by_branch)
+
+Chunked-sweep precompute for `sweep_order=:chunked` (deterministic: pure
+function of the tree, the influence-matrix sizes, and `nchunks` — no RNG, no
+thread dependence). Partitions the leaf sweep sequence `1:n_leaves` into
+`min(nchunks, n_leaves)` contiguous, nonempty chunks balanced by the per-leaf
+GEMV-flops proxy `cost_i = m_i*n_i + n_i^2` (self solve + nonself product),
+cutting at the smallest leaf where the cumulative cost reaches `k/nchunks` of
+the total. Also splits each source leaf's scatter segments into *intra-chunk*
+(every row the segment writes lies inside the source's own chunk — safe to
+apply during the parallel phase) and *cross-chunk* (deferred past the
+barrier). A segment targeting rows that span leaves of more than one chunk is
+always cross-chunk: applying it in the parallel phase would write rows
+another chunk owns. Row ownership uses the same binary-search-on-leaf-starts
+bracketing as `overlapping_leaves` in `color_leaves`.
+
+Returns `(chunk_ranges, scatter_intra, scatter_cross)`; segment tuples are
+`(direct_list index, influence-buffer offset)`, ascending per leaf.
+"""
+function build_chunk_map(nchunks::Int, source_tree::Tree, self_matrices::Matrices, nonself_matrices::Matrices, sorted_list::Vector{SVector{2,Int32}}, index_map::Vector{UnitRange{Int}}, targets_by_branch::Vector{UnitRange{Int}})
+
+    n_leaves = length(source_tree.leaf_index)
+    nchunks = min(nchunks, n_leaves)
+
+    # cumulative per-leaf cost (GEMV-flops proxy)
+    cumulative = Vector{Float64}(undef, n_leaves)
+    running = 0.0
+    for i_leaf in 1:n_leaves
+        n = self_matrices.sizes[i_leaf][2]
+        m = nonself_matrices.sizes[i_leaf][1]
+        running += Float64(m) * Float64(n) + Float64(n)^2
+        cumulative[i_leaf] = running
+    end
+    total = running
+
+    # contiguous cost-balanced partition; clamp keeps every chunk (including
+    # those still to come) nonempty
+    chunk_ranges = Vector{UnitRange{Int}}(undef, nchunks)
+    i_start = 1
+    for k in 1:nchunks-1
+        i_end = searchsortedfirst(cumulative, total * k / nchunks)
+        i_end = clamp(i_end, i_start, n_leaves - (nchunks - k))
+        chunk_ranges[k] = i_start:i_end
+        i_start = i_end + 1
+    end
+    chunk_ranges[nchunks] = i_start:n_leaves
+
+    # owning chunk per leaf
+    chunk_of_leaf = Vector{Int}(undef, n_leaves)
+    for (c, r) in enumerate(chunk_ranges), i_leaf in r
+        chunk_of_leaf[i_leaf] = c
+    end
+
+    # leaf row starts (leaf ranges tile the target rows contiguously in
+    # ascending order — same invariant `color_leaves` relies on)
+    leaf_starts = [first(targets_by_branch[i_branch]) for i_branch in source_tree.leaf_index]
+
+    # per-source-leaf scatter partition, ascending segment order (preserves
+    # the unsplit path's segment iteration order)
+    scatter_intra = [Tuple{Int,Int}[] for _ in 1:n_leaves]
+    scatter_cross = [Tuple{Int,Int}[] for _ in 1:n_leaves]
+    for i_leaf in 1:n_leaves
+        c = chunk_of_leaf[i_leaf]
+        i_influence_start = 1
+        for index in index_map[i_leaf]
+            i_target, _ = sorted_list[index]
+            rows = targets_by_branch[i_target]
+            if !isempty(rows)
+                lo = max(searchsortedlast(leaf_starts, first(rows)), 1)
+                hi = max(searchsortedlast(leaf_starts, last(rows)), 1)
+                if chunk_of_leaf[lo] == c && chunk_of_leaf[hi] == c
+                    push!(scatter_intra[i_leaf], (index, i_influence_start))
+                else
+                    push!(scatter_cross[i_leaf], (index, i_influence_start))
+                end
+            end
+            i_influence_start += get_n_bodies(source_tree.branches[i_target].bodies_index)
+        end
+    end
+
+    return chunk_ranges, scatter_intra, scatter_cross
+end
+
 """
     color_leaves(source_tree, sorted_list, index_map, targets_by_branch)
 
@@ -1057,6 +1198,18 @@ One Gauss-Seidel sweep over all source leaves.
   Coloring guarantees no same-color leaf reads rows another writes, so this
   reproduces sequential GS in color-major leaf order exactly (see
   `color_leaves`), deterministically at any thread count.
+- `sweep_order == :chunked`: hybrid Gauss-Seidel/Jacobi with one barrier per
+  sweep. Chunks (contiguous leaf ranges, see `build_chunk_map`) run in
+  parallel; within a chunk the serial GS loop runs unchanged with immediate
+  intra-chunk scatter; cross-chunk scatter is deferred past the barrier and
+  applied serially in ascending leaf order. The persistent per-leaf product
+  buffers hold each source's current-sweep products across the barrier, so
+  cross-chunk targets see influence evaluated at end-of-previous-parallel-
+  phase strengths — top-of-sweep-snapshot Jacobi semantics with no strength
+  copy. No shared location is written concurrently and every application
+  order is fixed by the chunk map, so results are bitwise reproducible and
+  invariant to thread count; with a single chunk the sweep is bit-identical
+  to `:lexicographic`.
 """
 function gs_sweep!(strengths, self_matrices, leaf_lu_cache, right_hand_side,
                    nonself_matrices, old_influence_storage, source_tree,
@@ -1085,6 +1238,39 @@ function gs_sweep!(strengths, self_matrices, leaf_lu_cache, right_hand_side,
                         nonself_matrices, old_influence_storage, i_leaf,
                         target_tree, index_map, direct_list, targets_by_branch)
                 end
+            end
+        end
+
+    elseif solver.sweep_order === :chunked
+
+        chunk_ranges = solver.chunk_ranges
+        # parallel phase: sequential GS within each chunk; all writes are
+        # chunk-disjoint (strength blocks, product/old-influence blocks, and
+        # intra-chunk rhs rows). :static is not needed for determinism
+        # (write-disjointness provides it) but gives reproducible thread
+        # placement for activity observation.
+        Threads.@threads :static for c in eachindex(chunk_ranges)
+            for i_leaf in chunk_ranges[c]
+                leaf_strengths = view(strengths, strengths_by_leaf[i_leaf])
+                solve_leaf!(leaf_strengths, self_matrices, leaf_lu_cache, i_leaf)
+                if length(direct_list) > 0
+                    compute_nonself_products!(strengths, nonself_matrices,
+                        old_influence_storage, i_leaf, strengths_by_leaf)
+                    scatter_nonself_influence_partial!(right_hand_side,
+                        nonself_matrices, old_influence_storage, i_leaf,
+                        solver.scatter_intra[i_leaf], target_tree, direct_list,
+                        targets_by_branch)
+                end
+            end
+        end
+        # deferred cross-chunk scatter, serial in fixed ascending leaf order
+        # (chunks are contiguous ascending, so this is plain ascending order)
+        if length(direct_list) > 0
+            for r in chunk_ranges, i_leaf in r
+                scatter_nonself_influence_partial!(right_hand_side,
+                    nonself_matrices, old_influence_storage, i_leaf,
+                    solver.scatter_cross[i_leaf], target_tree, direct_list,
+                    targets_by_branch)
             end
         end
 
