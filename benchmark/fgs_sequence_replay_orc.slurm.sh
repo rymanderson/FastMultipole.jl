@@ -70,8 +70,8 @@ run rowpar_f32_interleave_t$TBEST.log --interleave=all --cpunodebind=0 -- -t$TBE
 
 # 5. pull-DAG schedule analysis priced with this node's measured numbers:
 #    fill in B (serial useful GB/s) and h (handoff µs) from the logs above
-B=$(awk '/useful BW/ {gsub(/[()]/,""); print $(NF-1)}' "$OUT/serial_f64.log" | head -1)
-H=$(awk '/avg handoff/ {print $(NF-4)}' "$OUT/handoff_t$(echo $THREAD_LADDER | awk '{print $1}').log" | head -1)
+B=$(sed -n 's/.*useful BW (min): \([0-9.]*\) GB.*/\1/p' "$OUT/serial_f64.log" | head -1)
+H=$(sed -n 's/.*avg handoff = \([0-9.]*\) .*/\1/p' "$OUT/handoff_t$(echo $THREAD_LADDER | awk '{print $1}').log" | head -1)
 run dag.log --cpunodebind=0 --membind=0 -- -t1 $BENCH --mode dag --dag-bandwidth "${B:-29.4}" --dag-handoff-us "${H:-3.0}"
 
 echo "== done: results in $OUT =="
