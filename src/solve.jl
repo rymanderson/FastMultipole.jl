@@ -267,7 +267,16 @@ function nonself_influence_matrices(target_buffers::AbstractVector{<:Matrix}, so
             # loop over source systems
             this_i_source_start = i_source_start
 
+            # every source system's column block spans the SAME target rows;
+            # track them with a per-system cursor and advance the shared
+            # segment start only once (multi-system BoundsError fix)
+            seg_target_start = i_target_start
+            row_cursor = i_target_start
+
             for i_source_system in eachindex(source_systems)
+
+                # reset to the segment's first row for this column block
+                row_cursor = seg_target_start
 
                 # get view of matrix corresponding to this source system
                 source_index = source_branches[j_source].bodies_index[i_source_system]
@@ -284,8 +293,8 @@ function nonself_influence_matrices(target_buffers::AbstractVector{<:Matrix}, so
                     # get view of matrix corresponding to this source and target system
                     target_index = target_branches[i_target].bodies_index[i_target_system]
                     n_targets = length(target_index)
-                    this_matrix = view(matrix, i_target_start:i_target_start + n_targets - 1, this_i_source_start:this_i_source_start + n_sources - 1)
-                    this_influence = view(influence, i_target_start:i_target_start + n_targets - 1)
+                    this_matrix = view(matrix, row_cursor:row_cursor + n_targets - 1, this_i_source_start:this_i_source_start + n_sources - 1)
+                    this_influence = view(influence, row_cursor:row_cursor + n_targets - 1)
 
                     # unpack target buffer
                     target_buffer = target_buffers[i_target_system]
@@ -311,13 +320,16 @@ function nonself_influence_matrices(target_buffers::AbstractVector{<:Matrix}, so
 
                     end
 
-                    # update target starting index
-                    i_target_start += n_targets
+                    # update target row cursor
+                    row_cursor += n_targets
                 end
 
                 # update source starting index
                 this_i_source_start += length(source_index)
             end
+
+            # advance the shared segment start once per direct-list entry
+            i_target_start = row_cursor
         end
 
         # restore old strengths
@@ -613,10 +625,11 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
     interaction_list_method=Barba(), shrink=true, recenter=false,
     derivatives_switches=DerivativesSwitch(true, true, false, target_systems),
     extra_farfield=false, cache_leaf_lu::Bool=true,
-    sweep_order::Symbol=:lexicographic, chunks::Int=64
+    sweep_order::Symbol=:lexicographic, chunks::Int=64,
+    dagteam_precision::Symbol=:f64
 )
-    sweep_order in (:lexicographic, :colored, :chunked) || throw(ArgumentError(
-        "sweep_order must be :lexicographic, :colored, or :chunked (got $(repr(sweep_order)))"))
+    sweep_order in (:lexicographic, :colored, :chunked, :dagteam) || throw(ArgumentError(
+        "sweep_order must be :lexicographic, :colored, :chunked, or :dagteam (got $(repr(sweep_order)))"))
     chunks >= 1 || throw(ArgumentError(
         "chunks must be a positive integer (got $chunks)"))
 
@@ -744,7 +757,19 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
         scatter_cross = Vector{Tuple{Int,Int}}[]
     end
 
-    return FastGaussSeidel{TF,length(source_systems),typeof(interaction_list_method),typeof(leaf_lu_cache)}(
+    #--- dagteam-sweep structures (opt-in; nothing otherwise) ---#
+
+    if sweep_order === :dagteam
+        cache_leaf_lu || throw(ArgumentError(
+            "sweep_order=:dagteam requires cache_leaf_lu=true"))
+        dagteam = build_dagteam_plan(dagteam_precision, nonself_matrices,
+            sorted_list, index_map, source_tree, target_tree,
+            strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache)
+    else
+        dagteam = nothing
+    end
+
+    return FastGaussSeidel{TF,length(source_systems),typeof(interaction_list_method),typeof(leaf_lu_cache),typeof(dagteam)}(
         self_matrices,
         leaf_lu_cache,
         cache_leaf_lu,
@@ -772,6 +797,7 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
         chunk_ranges,
         scatter_intra,
         scatter_cross,
+        dagteam,
         Ref(false),
     )
 end
@@ -1400,8 +1426,14 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
     #--- non-self influence ---#
 
     # add nonself influence to the right-hand side
-    nonself_matrices.rhs .= zero(TF) # reset rhs
-    update_nonself_influence!(right_hand_side, strengths, nonself_matrices, old_influence_storage, source_tree, target_tree, strengths_by_leaf, index_map, direct_list, targets_by_branch)
+    if solver.sweep_order === :dagteam
+        # split-layout path: capture external rhs, prime u^0 = Ux^0 (warm
+        # starts), and subtract (L+U)x^0 — same result as the incremental init
+        dagteam_initialize!(right_hand_side, solver.dagteam, strengths)
+    else
+        nonself_matrices.rhs .= zero(TF) # reset rhs
+        update_nonself_influence!(right_hand_side, strengths, nonself_matrices, old_influence_storage, source_tree, target_tree, strengths_by_leaf, index_map, direct_list, targets_by_branch)
+    end
     diagnostics === nothing || (diagnostics[:initialization_ns] += time_ns() - initialization_start_ns)
     stage_observer === nothing || stage_observer(:initialization, :stop)
 
@@ -1485,6 +1517,23 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
         strengths_old .= strengths
         diagnostics === nothing || (diagnostics[:remaining_iteration_ns] += time_ns() - remaining_start_ns)
 
+        if solver.sweep_order === :dagteam
+
+            # split dual-layout executor (see solve_dagteam.jl); the
+            # historical reverse_pass quirk (a second FORWARD sweep) is
+            # preserved as an extra forward sweep per inner iteration
+            n_sweeps = inner_iterations * (reverse_pass ? 2 : 1)
+            if diagnostics !== nothing
+                diagnostics[:sweep_count] += n_sweeps
+                diagnostics[:leaf_visit_count] += n_sweeps * length(source_tree.leaf_index)
+            end
+            t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
+            dagteam_inner_sweeps!(right_hand_side, extra_right_hand_side,
+                strengths, solver.dagteam, n_sweeps)
+            diagnostics === nothing || (diagnostics[:nonself_product_ns] += time_ns() - t_stage)
+
+        else
+
         for i_inner in 1:inner_iterations
 
             if diagnostics !== nothing
@@ -1506,6 +1555,8 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
                 diagnostics === nothing || (diagnostics[:sweep_count] += 1)
                 diagnostics === nothing || (diagnostics[:leaf_visit_count] += length(source_tree.leaf_index))
             end
+
+        end
 
         end
 

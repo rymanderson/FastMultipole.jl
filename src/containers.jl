@@ -1104,7 +1104,67 @@ struct LeafLUCache{TF,LF}
     bytes::Int
 end
 
-struct FastGaussSeidel{TF,Nsys,TIL,TLC} <: AbstractSolver
+"""
+    DagTeamPlan{TM,TS,TF,TLU}
+
+Precomputed structures and preallocated state for `sweep_order=:dagteam` —
+the split dual-layout pull-DAG executor (BRAINSTORM 021 gate 2d). The nonself
+operator is repacked at construction into split triangular storage in
+lexicographic leaf order: target-major LOWER blocks (`Lmat[i]`: `n_i × ptot_i`,
+predecessor column blocks ascending by source leaf) pulled by readiness
+counters over the directed lower edges, and source-major UPPER blocks
+(`Umat[j]`: `mup_j × n_j`, target row blocks ascending by target leaf) whose
+products are buffered during the sweep and reduced target-owned at the sweep
+boundary into the next sweep's frozen upper accumulator `u`. Executing ready
+leaves out of index order preserves the lexicographic iterate by induction on
+the lower edges (mathematically equivalent, not bitwise: pulls aggregate all
+predecessors into one GEMV). Results are deterministic at any thread count:
+each pull gathers ascending predecessors into one single-threaded GEMV, each
+backward product is one single-threaded GEMV, and the boundary reduction runs
+serially in fixed ascending source order.
+
+`TM` is the coefficient storage type and `TS` the sweep state type
+(`dagteam_precision`: `:f64 → TM=TS=TF`, `:f32conv → TM=Float32, TS=TF`,
+`:f32full → TM=TS=Float32`). `TF` is the solver scalar type; residual checks
+and all outer-iteration bookkeeping stay in `TF`.
+"""
+struct DagTeamPlan{TM,TS,TF,TLU}
+    # directed lower graph (all leaf lists ascending)
+    preds::Vector{Vector{Int}}            # lower predecessors of target i
+    nsucc::Vector{Vector{Int}}            # lower successors of source j
+    uppers::Vector{Vector{Int}}           # targets i<j of source j's upper blocks
+    prio::Vector{Float64}                 # byte-weighted downstream critical path
+    indeg0::Vector{Int}
+    roots::Vector{Int}
+    # split coefficient storage
+    ptot::Vector{Int}                     # Σ n_j over preds[i]
+    mup::Vector{Int}                      # Σ n_i over uppers[j]
+    Lmat::Vector{Matrix{TM}}              # n_i × ptot[i]
+    Umat::Vector{Matrix{TM}}              # mup[j] × n_j
+    red::Vector{Vector{Tuple{Int,Int}}}   # target i ← (source j, row offset in q[j])
+    # leaf geometry: global strength/rhs row offsets (leaves tile 1:n ascending)
+    offset::Vector{Int}                   # length n_leaves + 1
+    # sweep state (TS)
+    x::Vector{TS}                         # sweep strengths (shadow of solver.strengths)
+    b::Vector{TS}                         # external + farfield rhs for the sweep block
+    u::Vector{TS}                         # frozen upper accumulator Ux^s
+    lsum::Vector{TS}                      # last sweep's lower pulls Lx (per target row)
+    q::Vector{Vector{TS}}                 # backward product buffers, length mup[j]
+    external_rhs::Vector{TF}              # external influence, captured at solve init
+    lus::TLU                              # leaf LU cache in TS (aliases solver's when TS==TF)
+    # per-worker gather/product scratch (length = nthreads at construction)
+    xg::Vector{Vector{TS}}
+    yb::Vector{Vector{TS}}
+    # scheduler state (reset each sweep)
+    indeg::Vector{Int}
+    readyQ::Vector{Int}
+    backQ::Vector{Int}
+    qlock::Threads.SpinLock
+    ndone::Threads.Atomic{Int}
+    ntasks::Int
+end
+
+struct FastGaussSeidel{TF,Nsys,TIL,TLC,TDT} <: AbstractSolver
     self_matrices::Matrices{TF}
     leaf_lu_cache::TLC
     cache_leaf_lu::Bool
@@ -1141,6 +1201,9 @@ struct FastGaussSeidel{TF,Nsys,TIL,TLC} <: AbstractSolver
     # can span several leaves' rows)
     scatter_intra::Vector{Vector{Tuple{Int,Int}}}
     scatter_cross::Vector{Vector{Tuple{Int,Int}}}
+    # dagteam-sweep mode (opt-in; split dual-layout pull-DAG executor — see
+    # `DagTeamPlan` and solve_dagteam.jl). `nothing` for other orders.
+    dagteam::TDT
     # set by transform_solver! (rigid-motion tree reuse): once true, solves
     # requesting gradient outputs refuse — the dense influence matrices embed
     # build-time gradient rows, which do not rotate with the body

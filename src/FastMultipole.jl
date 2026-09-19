@@ -251,6 +251,7 @@ export visualize
 include("probes.jl")
 
 include("solve.jl")
+include("solve_dagteam.jl")
 
 include("nearfield_cache.jl")
 
