@@ -15,10 +15,22 @@
 #   dag      – pull-DAG schedule analysis from the lower edges: unit and
 #              byte-weighted critical paths, measured-cost recurrence C_i,
 #              and a list-schedule simulation with backward-filler model
+#   dagteam  – REAL split dual-layout executor (gate 2d): lower triangle
+#              stored target-major, consumed as readiness-driven pulls over
+#              the directed lower edges; upper triangle stored source-major,
+#              backward products run as lower-priority filler tasks whose
+#              segments are reduced into the next sweep's upper accumulator
+#              at the sweep boundary. Run under numactl --interleave (task
+#              ownership is dynamic, owner first-touch is undefined here).
+#
+# Precision: (default) F64 storage+state; --f32 = F32 storage, convert on
+# load, F64 accumulate/state; --f32-full = F32 everywhere (storage, state,
+# accumulate, LU) — no convert cost, but a different numerical experiment
+# that must separately pass the independent accuracy evaluator.
 #
 # Usage:
 #   julia -t4 benchmark/fgs_sequence_replay.jl --mode rowpar --sweeps 9 \
-#         --census <gemv_census.csv> --edges <dependency_edges.csv> [--f32]
+#         --census <gemv_census.csv> --edges <dependency_edges.csv> [--f32|--f32-full]
 #
 # House rule: local runs ≤ 4 threads. Full-scale numbers come from a
 # single-socket HPC node with pinned threads (see the companion slurm script).
@@ -39,6 +51,7 @@ const NSWEEPS = parse(Int, getarg("--sweeps", "9"))
 const CENSUS  = getarg("--census", "gemv_census.csv")
 const EDGES   = getarg("--edges", "dependency_edges.csv")
 const USE_F32 = hasflag("--f32")
+const F32FULL = hasflag("--f32-full")
 const SMALL_BYTES = parse(Int, getarg("--small-bytes", "262144"))  # ≤ this: coordinator-serial
 const DAG_B = parse(Float64, getarg("--dag-bandwidth", "0.0"))     # GB/s for dag mode (0 = measure serial first)
 const DAG_H = parse(Float64, getarg("--dag-handoff-us", "0.0"))    # µs per task handoff in dag mode
@@ -108,7 +121,10 @@ const SEGS = [segmap(L) for L in LEAVES]
 
 const RNG = MersenneTwister(20260918)
 
-@printf "R4 replay: %d leaves, %d strengths, %.3f GB coefficients/sweep, mode=%s f32=%s threads=%d\n" NLEAF NSTR BYTES_PER_SWEEP/1e9 MODE USE_F32 nthreads()
+precname(::Type{TM}, ::Type{TS}) where {TM,TS} =
+    TM === Float64 ? "F64" : (TS === Float64 ? "F32conv" : "F32full")
+
+@printf "R4 replay: %d leaves, %d strengths, %.3f GB coefficients/sweep, mode=%s f32=%s f32full=%s threads=%d\n" NLEAF NSTR BYTES_PER_SWEEP/1e9 MODE USE_F32 F32FULL nthreads()
 
 # cheap deterministic fill (values are irrelevant to timing; avoids shared RNG
 # state so owner-mode first touch can fill tiles in parallel)
@@ -128,12 +144,12 @@ function alloc_matrices(::Type{T}) where T
     mats
 end
 
-# diagonal blocks: diagonally dominant, cached LU (Float64 always)
-function alloc_lus()
-    lus = Vector{LU{Float64,Matrix{Float64},Vector{Int}}}(undef, NLEAF)
+# diagonal blocks: diagonally dominant, cached LU (state precision TS)
+function alloc_lus(::Type{TS}=Float64) where TS
+    lus = Vector{LU{TS,Matrix{TS},Vector{Int}}}(undef, NLEAF)
     for (j, L) in enumerate(LEAVES)
-        A = rand(RNG, L.n, L.n) .- 0.5
-        A += (L.n + 1.0) * I
+        A = TS.(rand(RNG, L.n, L.n) .- 0.5)
+        A += TS(L.n + 1.0) * I
         lus[j] = lu!(A)
     end
     lus
@@ -141,8 +157,8 @@ end
 
 # ---------------------------------------------------------------- kernels
 
-# Float64 tile: y[r] = A[r,:] * x  via BLAS on a strided view
-@inline function tile_gemv!(y::AbstractVector{Float64}, A::Matrix{Float64}, r::UnitRange{Int}, x::AbstractVector{Float64})
+# same-precision tile: y[r] = A[r,:] * x  via BLAS on a strided view
+@inline function tile_gemv!(y::AbstractVector{T}, A::Matrix{T}, r::UnitRange{Int}, x::AbstractVector{T}) where T
     mul!(view(y, 1:length(r)), view(A, r, :), x)
 end
 
@@ -162,8 +178,8 @@ end
 
 # scatter `+= old` then `-= new` over the segments covered by local tile rows,
 # then store new into old. r is the local row range owned by this worker.
-function scatter_tile!(rhs::Vector{Float64}, old::Vector{Float64}, ynew::AbstractVector{Float64},
-                       sm::SegMap, r::UnitRange{Int})
+function scatter_tile!(rhs::Vector{T}, old::Vector{T}, ynew::AbstractVector{T},
+                       sm::SegMap, r::UnitRange{Int}) where T
     k = searchsortedlast(sm.loc_start, first(r))
     row = first(r)
     while row <= last(r)
@@ -186,13 +202,13 @@ end
 
 # ---------------------------------------------------------------- serial replay
 
-function run_serial(::Type{T}) where T
-    mats = alloc_matrices(T)
-    lus  = alloc_lus()
-    strengths = rand(RNG, NSTR)
-    rhs  = zeros(NSTR)
-    old  = [zeros(L.m) for L in LEAVES]
-    ybuf = zeros(maximum(L.m for L in LEAVES))
+function run_serial(::Type{TM}, ::Type{TS}) where {TM,TS}
+    mats = alloc_matrices(TM)
+    lus  = alloc_lus(TS)
+    strengths = rand(RNG, TS, NSTR)
+    rhs  = zeros(TS, NSTR)
+    old  = [zeros(TS, L.m) for L in LEAVES]
+    ybuf = zeros(TS, maximum(L.m for L in LEAVES))
     # prime old products (initialization pass, untimed)
     for j in 1:NLEAF
         x = view(strengths, OFFSET[j]+1:OFFSET[j+1])
@@ -204,13 +220,13 @@ function run_serial(::Type{T}) where T
         for j in 1:NLEAF
             x = view(strengths, OFFSET[j]+1:OFFSET[j+1])
             ldiv!(lus[j], x)                       # diagonal solve (in place)
-            clamp!(x, -1e3, 1e3)                   # keep replay numerics bounded
+            clamp!(x, TS(-1e3), TS(1e3))           # keep replay numerics bounded
             tile_gemv!(ybuf, mats[j], 1:LEAVES[j].m, x)
             scatter_tile!(rhs, old[j], ybuf, SEGS[j], 1:LEAVES[j].m)
         end
         push!(times, (time_ns() - t0) / 1e9)
     end
-    report("serial(:$(T))", times)
+    report("serial($(precname(TM,TS)))", times)
 end
 
 # ---------------------------------------------------------------- persistent row-parallel replay
@@ -222,13 +238,13 @@ mutable struct TeamState
     stop::Base.RefValue{Bool}
 end
 
-function run_rowpar(::Type{T}; payload::Bool=true) where T
+function run_rowpar(::Type{TM}, ::Type{TS}; payload::Bool=true) where {TM,TS}
     nw = nthreads()                       # coordinator participates as worker 1
-    lus  = payload ? alloc_lus() : LU{Float64,Matrix{Float64},Vector{Int}}[]
-    strengths = rand(RNG, NSTR)
-    rhs  = zeros(NSTR)
-    old  = [zeros(L.m) for L in LEAVES]
-    ybufs = [zeros(maximum(L.m for L in LEAVES)) for _ in 1:nw]
+    lus  = payload ? alloc_lus(TS) : LU{TS,Matrix{TS},Vector{Int}}[]
+    strengths = rand(RNG, TS, NSTR)
+    rhs  = zeros(TS, NSTR)
+    old  = [zeros(TS, L.m) for L in LEAVES]
+    ybufs = [zeros(TS, maximum(L.m for L in LEAVES)) for _ in 1:nw]
 
     # precompute per-leaf worker row tiles (balanced contiguous ranges)
     tiles = Matrix{UnitRange{Int}}(undef, NLEAF, nw)
@@ -244,10 +260,10 @@ function run_rowpar(::Type{T}; payload::Bool=true) where T
     end
 
     # coefficient allocation with the selected first-touch policy
-    mats = Vector{Matrix{T}}()
+    mats = Vector{Matrix{TM}}()
     if payload
         if FIRST_TOUCH == "owner"
-            mats = [Matrix{T}(undef, L.m, L.n) for L in LEAVES]
+            mats = [Matrix{TM}(undef, L.m, L.n) for L in LEAVES]
             Threads.@threads :static for w in 1:nw
                 for j in 1:NLEAF
                     if parallel_leaf[j]
@@ -258,7 +274,7 @@ function run_rowpar(::Type{T}; payload::Bool=true) where T
                 end
             end
         else
-            mats = alloc_matrices(T)                            # serial first touch
+            mats = alloc_matrices(TM)                           # serial first touch
         end
     end
 
@@ -303,7 +319,7 @@ function run_rowpar(::Type{T}; payload::Bool=true) where T
             if payload
                 x = view(strengths, OFFSET[j]+1:OFFSET[j+1])
                 ldiv!(lus[j], x)
-                clamp!(x, -1e3, 1e3)
+                clamp!(x, TS(-1e3), TS(1e3))
             end
             if parallel_leaf[j]
                 st.active[] = j
@@ -334,7 +350,7 @@ function run_rowpar(::Type{T}; payload::Bool=true) where T
     atomic_add!(st.epoch, 1)   # release spinners
     foreach(wait, workers)
 
-    label = payload ? "rowpar(:$(T), team=$nw, touch=$FIRST_TOUCH)" : "handoff(team=$nw)"
+    label = payload ? "rowpar($(precname(TM,TS)), team=$nw, touch=$FIRST_TOUCH)" : "handoff(team=$nw)"
     report(label, times)
     if !payload
         tot = sum(times)
@@ -452,18 +468,219 @@ function simulate_schedule(preds, pull_bytes, tsolve, B, h, W)
     maximum(finish)
 end
 
+# ---------------------------------------------------------------- split dual-layout team executor (gate 2d)
+#
+# Executes the split recurrence for real: each leaf i becomes ready when all
+# its lower predecessors have published (readiness counters over the directed
+# lower edges), then one worker gathers predecessor strengths, streams the
+# target-major lower matrix (one aggregated gemv), forms
+# x_i = b_i - Lx - u_i and solves the cached diagonal LU. Backward tasks
+# (source-major upper products q_j = U_j x_j^{s+1}) are queued after each
+# solve and run as lower-priority filler; their source-private segments are
+# reduced target-owned into the next sweep's upper accumulator at the sweep
+# boundary (reduction time is included in the sweep time). The frozen u^s is
+# never overwritten mid-sweep. Preserves the lexicographic iterate by
+# induction on the lower edges; execution order differs, so results are
+# mathematically equivalent, not bitwise.
+
+function run_dagteam(::Type{TM}, ::Type{TS}) where {TM,TS}
+    nw = nthreads()
+    # lower predecessors / upper target lists from the directed edges
+    preds = [Int[] for _ in 1:NLEAF]
+    for j in 1:NLEAF, i in LEAVES[j].deps
+        j < i && push!(preds[i], j)
+    end
+    uppers = [[i for i in LEAVES[j].deps if i < j] for j in 1:NLEAF]
+
+    # target-major lower storage (n_i × Σ n_j), source-major upper (mup_j × n_j)
+    ptot = [sum(LEAVES[j].n for j in preds[i]; init=0) for i in 1:NLEAF]
+    mup  = [sum(LEAVES[i].n for i in uppers[j]; init=0) for j in 1:NLEAF]
+    Lmat = [Matrix{TM}(undef, LEAVES[i].n, ptot[i]) for i in 1:NLEAF]
+    Umat = [Matrix{TM}(undef, mup[j], LEAVES[j].n) for j in 1:NLEAF]
+    for i in 1:NLEAF
+        ptot[i] > 0 && fillmat!(Lmat[i], 1:LEAVES[i].n, i)
+        mup[i]  > 0 && fillmat!(Umat[i], 1:mup[i], i + NLEAF)
+    end
+    @assert sum(sizeof(TM) * length(A) for A in Lmat) + sum(sizeof(TM) * length(A) for A in Umat) ==
+            div(BYTES_PER_SWEEP * sizeof(TM), 8) "split storage does not tile the census bytes"
+
+    # reduction map: target i receives (source j, offset into q_j)
+    red = [Tuple{Int,Int}[] for _ in 1:NLEAF]
+    for j in 1:NLEAF
+        off = 0
+        for i in uppers[j]
+            push!(red[i], (j, off))
+            off += LEAVES[i].n
+        end
+    end
+
+    lus = alloc_lus(TS)
+    strengths = rand(RNG, TS, NSTR)
+    bconst = rand(RNG, TS, NSTR)
+    u_acc  = zeros(TS, NSTR)
+    q = [zeros(TS, mup[j]) for j in 1:NLEAF]
+    xg = [zeros(TS, max(1, maximum(ptot))) for _ in 1:nw]
+    yb = [zeros(TS, maximum(L.n for L in LEAVES)) for _ in 1:nw]
+
+    # static priority = byte-weighted downstream critical path (lower graph)
+    nsucc = [Int[] for _ in 1:NLEAF]
+    for i in 1:NLEAF, j in preds[i]; push!(nsucc[j], i); end
+    prio = zeros(NLEAF)
+    for i in NLEAF:-1:1
+        p = 0.0
+        for k in nsucc[i]; p = max(p, prio[k]); end
+        prio[i] = p + Float64(LEAVES[i].n) * ptot[i]
+    end
+
+    # scheduler state: queues + indeg mutated only under qlock; ready-set
+    # scan-pop is fine (largest earliest cohort is single digits)
+    indeg0 = [length(preds[i]) for i in 1:NLEAF]
+    roots  = [i for i in 1:NLEAF if indeg0[i] == 0]
+    indeg  = copy(indeg0)
+    readyQ = Int[]; backQ = Int[]
+    qlock  = Threads.SpinLock()
+    ntasks = NLEAF + count(>(0), mup)
+    ndone  = Atomic{Int}(0)
+    epoch  = Atomic{Int}(0)
+    stop   = Ref(false)
+
+    pop_ready!(Q) = begin
+        best = 1
+        for k in 2:length(Q)
+            prio[Q[k]] > prio[Q[best]] && (best = k)
+        end
+        t = Q[best]; Q[best] = Q[end]; pop!(Q); t
+    end
+
+    do_lower(w, i) = begin
+        n = LEAVES[i].n
+        off = 0
+        xgv = xg[w]
+        @inbounds for j in preds[i]
+            copyto!(xgv, off + 1, strengths, OFFSET[j] + 1, LEAVES[j].n)
+            off += LEAVES[j].n
+        end
+        yv = view(yb[w], 1:n)
+        if ptot[i] > 0
+            yv = tile_gemv!(yb[w], Lmat[i], 1:n, view(xgv, 1:ptot[i]))
+        else
+            fill!(yv, zero(TS))
+        end
+        xv = view(strengths, OFFSET[i]+1:OFFSET[i+1])
+        @inbounds for k in 1:n
+            xv[k] = bconst[OFFSET[i]+k] - yv[k] - u_acc[OFFSET[i]+k]
+        end
+        ldiv!(lus[i], xv)
+        clamp!(xv, TS(-1e3), TS(1e3))
+        lock(qlock)
+        for k in nsucc[i]
+            (indeg[k] -= 1) == 0 && push!(readyQ, k)
+        end
+        mup[i] > 0 && push!(backQ, i)
+        unlock(qlock)
+        atomic_add!(ndone, 1)
+    end
+
+    do_back(w, j) = begin
+        xv = view(strengths, OFFSET[j]+1:OFFSET[j+1])
+        tile_gemv!(q[j], Umat[j], 1:mup[j], xv)
+        atomic_add!(ndone, 1)
+    end
+
+    drain(w) = begin
+        while ndone[] < ntasks
+            task = 0; isback = false
+            lock(qlock)
+            if !isempty(readyQ)
+                task = pop_ready!(readyQ)
+            elseif !isempty(backQ)
+                task = pop!(backQ); isback = true
+            end
+            unlock(qlock)
+            if task == 0
+                GC.safepoint()
+                ccall(:jl_cpu_pause, Cvoid, ())
+            elseif isback
+                do_back(w, task)
+            else
+                do_lower(w, task)
+            end
+        end
+    end
+
+    reduce_u!() = begin   # target-owned; runs while workers are parked
+        fill!(u_acc, zero(TS))
+        @inbounds for i in 1:NLEAF
+            base = OFFSET[i]; n = LEAVES[i].n
+            for (j, off) in red[i]
+                qj = q[j]
+                @simd for k in 1:n
+                    u_acc[base+k] += qj[off+k]
+                end
+            end
+        end
+    end
+
+    worker(w) = begin
+        my_epoch = 0
+        while true
+            while epoch[] == my_epoch
+                stop[] && return
+                GC.safepoint()
+                ccall(:jl_cpu_pause, Cvoid, ())
+            end
+            my_epoch += 1
+            drain(w)
+        end
+    end
+    workers = [@spawn worker($w) for w in 2:nw]
+
+    # prime u^0 from the initial strengths (untimed)
+    for j in 1:NLEAF
+        mup[j] > 0 && do_back(1, j)
+    end
+    reduce_u!()
+
+    times = Float64[]
+    for s in 1:NSWEEPS
+        # order matters: reset ndone first (parks any laggard on empty
+        # queues), then rebuild queues, then wake the team
+        t0 = time_ns()
+        ndone[] = 0
+        copyto!(indeg, indeg0)
+        lock(qlock); empty!(readyQ); append!(readyQ, roots); empty!(backQ); unlock(qlock)
+        atomic_add!(epoch, 1)
+        drain(1)
+        while ndone[] < ntasks   # laggard finishing its last task body
+            GC.safepoint(); ccall(:jl_cpu_pause, Cvoid, ())
+        end
+        reduce_u!()              # boundary reduction, counted in sweep time
+        push!(times, (time_ns() - t0) / 1e9)
+    end
+    stop[] = true
+    atomic_add!(epoch, 1)
+    foreach(wait, workers)
+
+    @assert all(isfinite, strengths) "non-finite replay state"
+    report("dagteam($(precname(TM,TS)), team=$nw)", times)
+    @printf "  lower tasks = %d (roots %d, edges %d), backward tasks = %d, lower/upper bytes = %d / %d (F64-equiv)\n" NLEAF length(roots) sum(length, preds) count(>(0), mup) sum(8 * LEAVES[i].n * ptot[i] for i in 1:NLEAF) sum(8 * mup[j] * LEAVES[j].n for j in 1:NLEAF)
+end
+
 # ---------------------------------------------------------------- dispatch
 
 BLAS.set_num_threads(1)
-T = USE_F32 ? Float32 : Float64
+const TMAT   = (USE_F32 || F32FULL) ? Float32 : Float64
+const TSTATE = F32FULL ? Float32 : Float64
 if MODE == "serial"
-    run_serial(T)
+    run_serial(TMAT, TSTATE)
 elseif MODE == "rowpar"
-    run_rowpar(T)
+    run_rowpar(TMAT, TSTATE)
 elseif MODE == "handoff"
-    run_rowpar(Float64; payload=false)
+    run_rowpar(Float64, Float64; payload=false)
 elseif MODE == "dag"
     run_dag()
+elseif MODE == "dagteam"
+    run_dagteam(TMAT, TSTATE)
 else
     error("unknown --mode $MODE")
 end
