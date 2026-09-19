@@ -214,10 +214,17 @@ if multi_supported
     @test rel_dev(x_lex, x_dag) <= 1e-12
     @info "gate-1 dagteam multi-system" rel_dev_strengths=rel_dev(x_lex, x_dag)
 
-    # truth oracle (catches consistent-but-wrong fill/scatter row ordering):
-    # solve for KNOWN strengths from their inverted potential and require
-    # both schedules to recover them
-    for order in (:lexicographic, :dagteam)
+    # truth oracle (catches consistent-but-wrong fill/scatter row ordering
+    # across systems): the KNOWN strengths must be a ONE-SWEEP fixed point
+    # of the all-direct (MAC=0.01) operator built from their inverted
+    # potential. A multi-sweep recovery oracle is unusable with this
+    # kernel: the 1/r first-kind potential operator has block-GS spectral
+    # radius >> 1 for any multi-leaf partition (a union-600 SINGLE-system
+    # control diverges identically, and per-sweep amplification ~5e5 blows
+    # even the fixed point past tolerance by sweep 2), so exactly one
+    # sweep is run. A misassembled operator breaks the fixed point by
+    # O(1e4) (negative controls below); a correct one moves ~4e-8.
+    function oracle_dev(order; corrupt=false)
         sa = generate_gravitational(11, 300)
         sb = generate_gravitational(22, 300)
         strengths_desired = vcat([bd.strength[1] for bd in sa.bodies],
@@ -226,16 +233,30 @@ if multi_supported
         sa.potential[1, :] .*= -1.0
         sb.potential[1, :] .*= -1.0
         fgs_m = FastMultipole.FastGaussSeidel((sa, sb), (sa, sb);
-            expansion_order=4, multipole_acceptance=0.5, leaf_size=40,
+            expansion_order=4, multipole_acceptance=0.01, leaf_size=40,
             shrink=true, recenter=false, sweep_order=order)
+        @assert isempty(fgs_m.m2l_list) && !isempty(fgs_m.direct_list) # all-direct premise
+        if corrupt   # sensitivity control: 1% scaling of the nonself operator
+            if order === :dagteam
+                foreach(m -> m .*= 1.01, fgs_m.dagteam.Lmat)
+                foreach(m -> m .*= 1.01, fgs_m.dagteam.Umat)
+            else
+                fgs_m.nonself_matrices.data .*= 1.01
+            end
+        end
         FastMultipole.solve!((sa, sb), (sa, sb), fgs_m; scalar_potential=true,
-            gradient=false, max_iterations=50, inner_iterations=2,
-            tolerance=1e-10, verbose=false, final_update=false)
+            gradient=false, max_iterations=1, inner_iterations=1,
+            tolerance=0.0, verbose=false, final_update=false)
         recovered = vcat([bd.strength[1] for bd in sa.bodies],
                          [bd.strength[1] for bd in sb.bodies])
-        dev = norm(recovered .- strengths_desired, Inf)
+        return norm(recovered .- strengths_desired, Inf)
+    end
+    for order in (:lexicographic, :dagteam)
+        dev = oracle_dev(order)
         @test dev <= 1e-6
-        @info "gate-1 multi-system strength recovery" order max_abs_dev=dev
+        dev_corrupt = oracle_dev(order; corrupt=true)
+        @test dev_corrupt > 1e-2   # oracle must catch a corrupted operator
+        @info "gate-1 multi-system fixed-point oracle" order max_abs_dev=dev corrupted_dev=dev_corrupt
     end
 end
 
