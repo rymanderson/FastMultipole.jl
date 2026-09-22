@@ -77,7 +77,8 @@ end
 """
     build_dagteam_plan(precision, nonself_matrices, sorted_list, index_map,
                        source_tree, target_tree, strengths_by_leaf,
-                       targets_by_branch, self_matrices, leaf_lu_cache)
+                       targets_by_branch, self_matrices, leaf_lu_cache;
+                       nworkers=Threads.nthreads())
 
 Build the `DagTeamPlan` for `sweep_order=:dagteam` by repacking the
 source-major nonself matrices into split triangular storage (see
@@ -92,13 +93,20 @@ whole solve leaves; no direct target branch contains its own source leaf; no
 duplicate (source, target-leaf) blocks. The source-major `nonself_matrices`
 are retained unchanged (other sweep orders and warm-start replay still use
 them) — :dagteam therefore holds a second, split copy of the coefficients.
+
+`nworkers` caps the sweep team size (coordinator + spawned workers ≤
+`nworkers`); capped-out workers are never spawned, so they cannot poll or
+join active-team barriers. Clamped to `1:Threads.nthreads()`. Completion is
+an atomic task counter over a shared queue (not a fixed-arrival barrier), so
+any team size drains the same queue without deadlock.
 """
 function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
         sorted_list::Vector{SVector{2,Int32}}, index_map::Vector{UnitRange{Int}},
         source_tree::Tree, target_tree::Tree,
         strengths_by_leaf::Vector{UnitRange{Int}},
         targets_by_branch::Vector{UnitRange{Int}},
-        self_matrices::Matrices{TF}, leaf_lu_cache) where TF
+        self_matrices::Matrices{TF}, leaf_lu_cache;
+        nworkers::Integer=Threads.nthreads()) where TF
 
     precision in (:f64, :f32conv, :f32full) || throw(ArgumentError(
         "dagteam_precision must be :f64, :f32conv, or :f32full (got $(repr(precision)))"))
@@ -246,7 +254,9 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
     lsum = zeros(TS, nstr)
     q = [zeros(TS, mup[j]) for j in 1:n_leaves]
     external_rhs = zeros(TF, nstr)
-    nw = Threads.nthreads()
+    # team size = length(xg): dagteam_start_team! spawns length(xg)-1 workers
+    # and dagteam_initialize! partitions over 1:length(xg)
+    nw = clamp(Int(nworkers), 1, Threads.nthreads())
     max_ptot = max(1, maximum(ptot; init=1))
     max_n = max(1, maximum(nof(i) for i in 1:n_leaves; init=1))
     xg = [zeros(TS, max_ptot) for _ in 1:nw]
@@ -413,7 +423,12 @@ end
 
 # one sweep: reset counters FIRST (parks any laggard on empty queues), rebuild
 # queues, wake the team, drain as the coordinator, then the boundary reduction
-function dagteam_sweep!(plan::DagTeamPlan, rt::DagTeamRuntime)
+#
+# `diagnostics` (optional Dict) accumulates coordinator-side coarse timers:
+# :dagteam_wait_ns (post-drain laggard wait) and :dagteam_reduce_ns (serial
+# boundary reduction). Both are SUBSETS of solve!'s :nonself_product_ns —
+# existing keys keep their meaning. Only the coordinator writes the dict.
+function dagteam_sweep!(plan::DagTeamPlan, rt::DagTeamRuntime, diagnostics=nothing)
     plan.ndone[] = 0
     copyto!(plan.indeg, plan.indeg0)
     lock(plan.qlock)
@@ -423,11 +438,15 @@ function dagteam_sweep!(plan::DagTeamPlan, rt::DagTeamRuntime)
     unlock(plan.qlock)
     Threads.atomic_add!(rt.epoch, 1)
     dagteam_drain!(plan, 1)
+    t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
     while plan.ndone[] < plan.ntasks   # laggard finishing its last task body
         GC.safepoint()
         ccall(:jl_cpu_pause, Cvoid, ())
     end
+    diagnostics === nothing || (diagnostics[:dagteam_wait_ns] += time_ns() - t_stage)
+    t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
     dagteam_reduce_u!(plan)
+    diagnostics === nothing || (diagnostics[:dagteam_reduce_ns] += time_ns() - t_stage)
     return nothing
 end
 
@@ -477,19 +496,25 @@ end
 # rhs = external + farfield − Lx − Ux at the new iterate
 function dagteam_inner_sweeps!(right_hand_side, extra_right_hand_side,
         strengths::Vector{TF}, plan::DagTeamPlan{TM,TS,TF},
-        n_sweeps::Int) where {TM,TS,TF}
+        n_sweeps::Int, diagnostics=nothing) where {TM,TS,TF}
 
     @inbounds for k in eachindex(plan.b)
         plan.b[k] = TS(plan.external_rhs[k] + extra_right_hand_side[k])
         plan.x[k] = TS(strengths[k])
     end
+    # team lifecycle timers (:dagteam_spawn_ns / :dagteam_join_ns) are subsets
+    # of solve!'s :nonself_product_ns, like the sweep timers above
+    t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
     rt = dagteam_start_team!(plan)
+    diagnostics === nothing || (diagnostics[:dagteam_spawn_ns] += time_ns() - t_stage)
     try
         for _ in 1:n_sweeps
-            dagteam_sweep!(plan, rt)
+            dagteam_sweep!(plan, rt, diagnostics)
         end
     finally
+        t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
         dagteam_stop_team!(rt)
+        diagnostics === nothing || (diagnostics[:dagteam_join_ns] += time_ns() - t_stage)
     end
     @inbounds for k in eachindex(strengths)
         strengths[k] = TF(plan.x[k])

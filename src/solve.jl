@@ -626,7 +626,7 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
     derivatives_switches=DerivativesSwitch(true, true, false, target_systems),
     extra_farfield=false, cache_leaf_lu::Bool=true,
     sweep_order::Symbol=:lexicographic, chunks::Int=64,
-    dagteam_precision::Symbol=:f64
+    dagteam_precision::Symbol=:f64, dagteam_workers::Int=0
 )
     sweep_order in (:lexicographic, :colored, :chunked, :dagteam) || throw(ArgumentError(
         "sweep_order must be :lexicographic, :colored, :chunked, or :dagteam (got $(repr(sweep_order)))"))
@@ -762,9 +762,12 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
     if sweep_order === :dagteam
         cache_leaf_lu || throw(ArgumentError(
             "sweep_order=:dagteam requires cache_leaf_lu=true"))
+        # dagteam_workers caps the sweep team size (0 = all threads); see
+        # build_dagteam_plan for the no-deadlock argument
         dagteam = build_dagteam_plan(dagteam_precision, nonself_matrices,
             sorted_list, index_map, source_tree, target_tree,
-            strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache)
+            strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache;
+            nworkers=(dagteam_workers == 0 ? Threads.nthreads() : dagteam_workers))
     else
         dagteam = nothing
     end
@@ -1348,9 +1351,15 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
     solve_start_ns = diagnostics === nothing ? UInt64(0) : time_ns()
     if diagnostics !== nothing
         empty!(diagnostics)
+        # the four :dagteam_* keys are SUBSETS of :nonself_product_ns (which
+        # for :dagteam wraps all of dagteam_inner_sweeps!): team spawn/join
+        # once per outer iteration, laggard wait + serial boundary reduction
+        # once per sweep. They stay zero for other sweep orders.
         for key in (:total_ns, :initialization_ns, :fmm_ns, :influence_mapping_ns,
                     :residual_ns, :leaf_solve_ns, :nonself_product_ns,
                     :scatter_ns, :remaining_iteration_ns, :final_update_ns,
+                    :dagteam_spawn_ns, :dagteam_join_ns, :dagteam_wait_ns,
+                    :dagteam_reduce_ns,
                     :outer_count, :sweep_count, :leaf_visit_count)
             diagnostics[key] = UInt64(0)
         end
@@ -1529,7 +1538,7 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
             end
             t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
             dagteam_inner_sweeps!(right_hand_side, extra_right_hand_side,
-                strengths, solver.dagteam, n_sweeps)
+                strengths, solver.dagteam, n_sweeps, diagnostics)
             diagnostics === nothing || (diagnostics[:nonself_product_ns] += time_ns() - t_stage)
 
         else
