@@ -626,7 +626,8 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
     derivatives_switches=DerivativesSwitch(true, true, false, target_systems),
     extra_farfield=false, cache_leaf_lu::Bool=true,
     sweep_order::Symbol=:lexicographic, chunks::Int=64,
-    dagteam_precision::Symbol=:f64, dagteam_workers::Int=0
+    dagteam_precision::Symbol=:f64, dagteam_workers::Int=0,
+    dagteam_idle::Symbol=:spin
 )
     sweep_order in (:lexicographic, :colored, :chunked, :dagteam) || throw(ArgumentError(
         "sweep_order must be :lexicographic, :colored, :chunked, or :dagteam (got $(repr(sweep_order)))"))
@@ -767,7 +768,8 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
         dagteam = build_dagteam_plan(dagteam_precision, nonself_matrices,
             sorted_list, index_map, source_tree, target_tree,
             strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache;
-            nworkers=(dagteam_workers == 0 ? Threads.nthreads() : dagteam_workers))
+            nworkers=(dagteam_workers == 0 ? Threads.nthreads() : dagteam_workers),
+            idle_policy=dagteam_idle)
     else
         dagteam = nothing
     end
@@ -1360,6 +1362,14 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
                     :scatter_ns, :remaining_iteration_ns, :final_update_ns,
                     :dagteam_spawn_ns, :dagteam_join_ns, :dagteam_wait_ns,
                     :dagteam_reduce_ns,
+                    # per-worker drain-loop aggregates (021 Stage 2); subsets
+                    # of :nonself_product_ns except the counts; zero for
+                    # non-dagteam sweep orders
+                    :dagteam_busy_lower_ns, :dagteam_busy_back_ns,
+                    :dagteam_lockmgmt_ns, :dagteam_idle_ns,
+                    :dagteam_busy_max_ns, :dagteam_busy_min_ns,
+                    :dagteam_empty_pops, :dagteam_n_lower, :dagteam_n_back,
+                    :dagteam_team_size,
                     :outer_count, :sweep_count, :leaf_visit_count)
             diagnostics[key] = UInt64(0)
         end

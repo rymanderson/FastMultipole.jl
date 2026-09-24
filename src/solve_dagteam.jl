@@ -99,6 +99,15 @@ them) — :dagteam therefore holds a second, split copy of the coefficients.
 join active-team barriers. Clamped to `1:Threads.nthreads()`. Completion is
 an atomic task counter over a shared queue (not a fixed-arrival barrier), so
 any team size drains the same queue without deadlock.
+
+`idle_policy` selects what a worker does when both queues are empty:
+`:spin` (default, production) busy-polls the queue lock; `:backoff` pauses
+in a bounded exponential loop gated on the `qhint` atomic queue-length hint,
+never touching the lock while the hint is zero (BRAINSTORM 021 Stage 2
+waiting-policy probe). Both policies preserve dependency visibility (`qhint`
+is updated under the same lock that publishes tasks), progress (the pause
+bound is finite and the drain loop re-checks the completion counter), and
+arithmetic ordering (scheduling never affects values — see above).
 """
 function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
         sorted_list::Vector{SVector{2,Int32}}, index_map::Vector{UnitRange{Int}},
@@ -106,10 +115,13 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
         strengths_by_leaf::Vector{UnitRange{Int}},
         targets_by_branch::Vector{UnitRange{Int}},
         self_matrices::Matrices{TF}, leaf_lu_cache;
-        nworkers::Integer=Threads.nthreads()) where TF
+        nworkers::Integer=Threads.nthreads(),
+        idle_policy::Symbol=:spin) where TF
 
     precision in (:f64, :f32conv, :f32full) || throw(ArgumentError(
         "dagteam_precision must be :f64, :f32conv, or :f32full (got $(repr(precision)))"))
+    idle_policy in (:spin, :backoff) || throw(ArgumentError(
+        "dagteam idle_policy must be :spin or :backoff (got $(repr(idle_policy)))"))
     TM = precision === :f64 ? TF : Float32
     TS = precision === :f32full ? Float32 : TF
 
@@ -278,7 +290,8 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
     return DagTeamPlan{TM,TS,TF,typeof(lus)}(preds, nsucc, uppers, prio, indeg0,
         roots, ptot, mup, Lmat, Umat, red, offset, x, b, u, lsum, q,
         external_rhs, lus, xg, yb, indeg, readyQ, backQ, Threads.SpinLock(),
-        Threads.Atomic{Int}(0), ntasks)
+        Threads.Atomic{Int}(0), ntasks, idle_policy, Threads.Atomic{Int}(0),
+        [DagWorkerStats() for _ in 1:nw], Ref(false))
 end
 
 #------- sweep executor -------#
@@ -320,6 +333,7 @@ function dagteam_do_lower!(plan::DagTeamPlan{TM,TS}, w::Int, i::Int) where {TM,T
         (plan.indeg[k] -= 1) == 0 && push!(plan.readyQ, k)
     end
     plan.mup[i] > 0 && push!(plan.backQ, i)
+    plan.qhint[] = length(plan.readyQ) + length(plan.backQ)
     unlock(plan.qlock)
     Threads.atomic_add!(plan.ndone, 1)
     return nothing
@@ -361,10 +375,20 @@ end
     return t
 end
 
+# Aggregates (only while plan.collect_stats[]; per-worker, padded — no shared
+# counters, and idle-streak lock churn is deliberately NOT timed per spin):
+#   lockmgmt_ns — busy-path lock+pop time (acquisitions on the critical path);
+#   idle_ns     — empty-pop streaks, timed at the streak boundaries only;
+#   busy_*_ns   — task bodies (do_lower! includes its publish lock).
 function dagteam_drain!(plan::DagTeamPlan, w::Int)
+    backoff = plan.idle_policy === :backoff
+    cs = plan.collect_stats[]
+    st = plan.stats[w]
+    idle_t0 = UInt64(0)   # nonzero while inside an empty-pop streak
     while plan.ndone[] < plan.ntasks
         task = 0
         isback = false
+        t0 = (cs && idle_t0 == 0) ? time_ns() : UInt64(0)
         lock(plan.qlock)
         if !isempty(plan.readyQ)
             task = dagteam_pop_ready!(plan.readyQ, plan.prio)
@@ -372,17 +396,48 @@ function dagteam_drain!(plan::DagTeamPlan, w::Int)
             task = pop!(plan.backQ)
             isback = true
         end
+        task == 0 || (plan.qhint[] = length(plan.readyQ) + length(plan.backQ))
         unlock(plan.qlock)
+        t0 == 0 || (st.lockmgmt_ns += time_ns() - t0)
         if task == 0
-            GC.safepoint()
-            ccall(:jl_cpu_pause, Cvoid, ())
-        elseif isback
-            dagteam_do_back_product!(plan, task)
-            Threads.atomic_add!(plan.ndone, 1)
+            if cs
+                idle_t0 == 0 && (idle_t0 = time_ns())
+                st.empty_pops += 1
+            end
+            if backoff
+                # bounded exponential pause gated on the queue-length hint —
+                # no lock traffic while empty; progress is guaranteed because
+                # qhint is set under the same lock that publishes tasks and
+                # the outer loop re-checks the completion counter
+                delay = 32
+                while plan.qhint[] == 0 && plan.ndone[] < plan.ntasks
+                    for _ in 1:delay
+                        ccall(:jl_cpu_pause, Cvoid, ())
+                    end
+                    GC.safepoint()
+                    delay = min(delay << 1, 4096)
+                end
+            else
+                GC.safepoint()
+                ccall(:jl_cpu_pause, Cvoid, ())
+            end
         else
-            dagteam_do_lower!(plan, w, task)
+            if cs && idle_t0 != 0
+                st.idle_ns += time_ns() - idle_t0
+                idle_t0 = UInt64(0)
+            end
+            t1 = cs ? time_ns() : UInt64(0)
+            if isback
+                dagteam_do_back_product!(plan, task)
+                Threads.atomic_add!(plan.ndone, 1)
+                cs && (st.busy_back_ns += time_ns() - t1; st.n_back += 1)
+            else
+                dagteam_do_lower!(plan, w, task)
+                cs && (st.busy_lower_ns += time_ns() - t1; st.n_lower += 1)
+            end
         end
     end
+    cs && idle_t0 != 0 && (st.idle_ns += time_ns() - idle_t0)
     return nothing
 end
 
@@ -435,6 +490,7 @@ function dagteam_sweep!(plan::DagTeamPlan, rt::DagTeamRuntime, diagnostics=nothi
     empty!(plan.readyQ)
     append!(plan.readyQ, plan.roots)
     empty!(plan.backQ)
+    plan.qhint[] = length(plan.readyQ)
     unlock(plan.qlock)
     Threads.atomic_add!(rt.epoch, 1)
     dagteam_drain!(plan, 1)
@@ -502,6 +558,13 @@ function dagteam_inner_sweeps!(right_hand_side, extra_right_hand_side,
         plan.b[k] = TS(plan.external_rhs[k] + extra_right_hand_side[k])
         plan.x[k] = TS(strengths[k])
     end
+    # per-worker aggregates: reset per inner-sweep block, folded into the
+    # diagnostics dict below (accumulating across the solve's outer iterations
+    # like every other key; busy_max/min therefore sum per-block extrema)
+    plan.collect_stats[] = diagnostics !== nothing
+    if plan.collect_stats[]
+        foreach(reset!, plan.stats)
+    end
     # team lifecycle timers (:dagteam_spawn_ns / :dagteam_join_ns) are subsets
     # of solve!'s :nonself_product_ns, like the sweep timers above
     t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
@@ -515,6 +578,24 @@ function dagteam_inner_sweeps!(right_hand_side, extra_right_hand_side,
         t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
         dagteam_stop_team!(rt)
         diagnostics === nothing || (diagnostics[:dagteam_join_ns] += time_ns() - t_stage)
+    end
+    if diagnostics !== nothing
+        # per-worker aggregate rollup (021 Stage 2). Sums are over the team;
+        # busy extrema accumulate per inner-sweep block (imbalance indicator,
+        # not a single-block extremum). All are subsets of :nonself_product_ns
+        # except the counts.
+        busy = [st.busy_lower_ns + st.busy_back_ns for st in plan.stats]
+        diagnostics[:dagteam_busy_lower_ns] += sum(st.busy_lower_ns for st in plan.stats)
+        diagnostics[:dagteam_busy_back_ns] += sum(st.busy_back_ns for st in plan.stats)
+        diagnostics[:dagteam_lockmgmt_ns] += sum(st.lockmgmt_ns for st in plan.stats)
+        diagnostics[:dagteam_idle_ns] += sum(st.idle_ns for st in plan.stats)
+        diagnostics[:dagteam_busy_max_ns] += maximum(busy)
+        diagnostics[:dagteam_busy_min_ns] += minimum(busy)
+        diagnostics[:dagteam_empty_pops] += UInt64(sum(st.empty_pops for st in plan.stats))
+        diagnostics[:dagteam_n_lower] += UInt64(sum(st.n_lower for st in plan.stats))
+        diagnostics[:dagteam_n_back] += UInt64(sum(st.n_back for st in plan.stats))
+        diagnostics[:dagteam_team_size] = UInt64(length(plan.stats))
+        plan.collect_stats[] = false
     end
     @inbounds for k in eachindex(strengths)
         strengths[k] = TF(plan.x[k])

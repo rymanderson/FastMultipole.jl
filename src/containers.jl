@@ -1104,6 +1104,31 @@ struct LeafLUCache{TF,LF}
     bytes::Int
 end
 
+# per-worker aggregates for the :dagteam drain loop (BRAINSTORM 021 Stage 2):
+# completed task counts, useful work, queue-management/lock time, and
+# empty-queue idle time. One mutable instance per worker — each is its own
+# heap allocation, padded past a cache line so two workers never write the
+# same line. Collected only while `DagTeamPlan.collect_stats[]` is set.
+mutable struct DagWorkerStats
+    n_lower::Int
+    n_back::Int
+    busy_lower_ns::UInt64   # dagteam_do_lower! bodies (includes the publish lock)
+    busy_back_ns::UInt64    # dagteam_do_back_product! bodies
+    lockmgmt_ns::UInt64     # busy-path queue lock+pop time (idle-streak churn excluded)
+    idle_ns::UInt64         # empty-pop streak time (includes its lock churn)
+    empty_pops::Int
+    _pad::NTuple{8,UInt64}
+    DagWorkerStats() = new(0, 0, 0, 0, 0, 0, 0, ntuple(_ -> UInt64(0), 8))
+end
+
+function reset!(st::DagWorkerStats)
+    st.n_lower = 0; st.n_back = 0
+    st.busy_lower_ns = 0; st.busy_back_ns = 0
+    st.lockmgmt_ns = 0; st.idle_ns = 0
+    st.empty_pops = 0
+    return st
+end
+
 """
     DagTeamPlan{TM,TS,TF,TLU}
 
@@ -1162,6 +1187,14 @@ struct DagTeamPlan{TM,TS,TF,TLU}
     qlock::Threads.SpinLock
     ndone::Threads.Atomic{Int}
     ntasks::Int
+    # idle policy: :spin busy-polls the queue lock (production default);
+    # :backoff pauses in a bounded exponential loop gated on `qhint`, never
+    # touching the lock while both queues are empty (BRAINSTORM 021 Stage 2)
+    idle_policy::Symbol
+    qhint::Threads.Atomic{Int}            # length(readyQ)+length(backQ); updated under qlock
+    # per-worker aggregates, length = team size; live only while collect_stats[]
+    stats::Vector{DagWorkerStats}
+    collect_stats::Base.RefValue{Bool}
 end
 
 struct FastGaussSeidel{TF,Nsys,TIL,TLC,TDT} <: AbstractSolver
