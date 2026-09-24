@@ -627,10 +627,10 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
     extra_farfield=false, cache_leaf_lu::Bool=true,
     sweep_order::Symbol=:lexicographic, chunks::Int=64,
     dagteam_precision::Symbol=:f64, dagteam_workers::Int=0,
-    dagteam_idle::Symbol=:spin
+    dagteam_idle::Symbol=:spin, dagedge_theta::Int=4096
 )
-    sweep_order in (:lexicographic, :colored, :chunked, :dagteam) || throw(ArgumentError(
-        "sweep_order must be :lexicographic, :colored, :chunked, or :dagteam (got $(repr(sweep_order)))"))
+    sweep_order in (:lexicographic, :colored, :chunked, :dagteam, :dagedge) || throw(ArgumentError(
+        "sweep_order must be :lexicographic, :colored, :chunked, :dagteam, or :dagedge (got $(repr(sweep_order)))"))
     chunks >= 1 || throw(ArgumentError(
         "chunks must be a positive integer (got $chunks)"))
 
@@ -758,18 +758,23 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
         scatter_cross = Vector{Tuple{Int,Int}}[]
     end
 
-    #--- dagteam-sweep structures (opt-in; nothing otherwise) ---#
+    #--- dagteam/dagedge-sweep structures (opt-in; nothing otherwise) ---#
 
-    if sweep_order === :dagteam
+    if sweep_order === :dagteam || sweep_order === :dagedge
         cache_leaf_lu || throw(ArgumentError(
-            "sweep_order=:dagteam requires cache_leaf_lu=true"))
+            "sweep_order=$(repr(sweep_order)) requires cache_leaf_lu=true"))
         # dagteam_workers caps the sweep team size (0 = all threads); see
         # build_dagteam_plan for the no-deadlock argument
-        dagteam = build_dagteam_plan(dagteam_precision, nonself_matrices,
-            sorted_list, index_map, source_tree, target_tree,
-            strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache;
-            nworkers=(dagteam_workers == 0 ? Threads.nthreads() : dagteam_workers),
-            idle_policy=dagteam_idle)
+        nworkers = dagteam_workers == 0 ? Threads.nthreads() : dagteam_workers
+        dagteam = sweep_order === :dagteam ?
+            build_dagteam_plan(dagteam_precision, nonself_matrices,
+                sorted_list, index_map, source_tree, target_tree,
+                strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache;
+                nworkers, idle_policy=dagteam_idle) :
+            build_dagedge_plan(dagteam_precision, nonself_matrices,
+                sorted_list, index_map, source_tree, target_tree,
+                strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache;
+                nworkers, idle_policy=dagteam_idle, theta=dagedge_theta)
     else
         dagteam = nothing
     end
@@ -1445,9 +1450,10 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
     #--- non-self influence ---#
 
     # add nonself influence to the right-hand side
-    if solver.sweep_order === :dagteam
+    if solver.sweep_order === :dagteam || solver.sweep_order === :dagedge
         # split-layout path: capture external rhs, prime u^0 = Ux^0 (warm
         # starts), and subtract (L+U)x^0 — same result as the incremental init
+        # (a DagEdgePlan forwards to its wrapped DagTeamPlan)
         dagteam_initialize!(right_hand_side, solver.dagteam, strengths)
     else
         nonself_matrices.rhs .= zero(TF) # reset rhs
@@ -1536,19 +1542,25 @@ function solve!(target_systems::Tuple, source_systems::Tuple, solver::FastGaussS
         strengths_old .= strengths
         diagnostics === nothing || (diagnostics[:remaining_iteration_ns] += time_ns() - remaining_start_ns)
 
-        if solver.sweep_order === :dagteam
+        if solver.sweep_order === :dagteam || solver.sweep_order === :dagedge
 
-            # split dual-layout executor (see solve_dagteam.jl); the
-            # historical reverse_pass quirk (a second FORWARD sweep) is
-            # preserved as an extra forward sweep per inner iteration
+            # split dual-layout executors (see solve_dagteam.jl /
+            # solve_dagedge.jl); the historical reverse_pass quirk (a second
+            # FORWARD sweep) is preserved as an extra forward sweep per
+            # inner iteration
             n_sweeps = inner_iterations * (reverse_pass ? 2 : 1)
             if diagnostics !== nothing
                 diagnostics[:sweep_count] += n_sweeps
                 diagnostics[:leaf_visit_count] += n_sweeps * length(source_tree.leaf_index)
             end
             t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
-            dagteam_inner_sweeps!(right_hand_side, extra_right_hand_side,
-                strengths, solver.dagteam, n_sweeps, diagnostics)
+            if solver.sweep_order === :dagteam
+                dagteam_inner_sweeps!(right_hand_side, extra_right_hand_side,
+                    strengths, solver.dagteam, n_sweeps, diagnostics)
+            else
+                dagedge_inner_sweeps!(right_hand_side, extra_right_hand_side,
+                    strengths, solver.dagteam, n_sweeps, diagnostics)
+            end
             diagnostics === nothing || (diagnostics[:nonself_product_ns] += time_ns() - t_stage)
 
         else

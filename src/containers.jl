@@ -1197,6 +1197,49 @@ struct DagTeamPlan{TM,TS,TF,TLU}
     collect_stats::Base.RefValue{Bool}
 end
 
+# one static-schedule task for sweep_order=:dagedge (see DagEdgePlan):
+# 0x01 big-edge partial (target i, source j, slot in Y[i], column offset in
+# Lmat[i]); 0x02 small-edge aggregate of leaf i (slot = last of Y[i]);
+# 0x03 root finalize of leaf i; 0x04 backward product of source leaf i
+struct DagEdgeTask
+    kind::UInt8
+    i::Int32
+    j::Int32
+    slot::Int32
+    col0::Int32
+end
+
+"""
+    DagEdgePlan{TM,TS,TF,TLU}
+
+Precomputed structures for `sweep_order=:dagedge` — edge-level partial pulls
+on a static per-worker schedule (BRAINSTORM 021 L-shortening item #1; see
+solve_dagedge.jl). Wraps an unmodified [`DagTeamPlan`](@ref) (`base`: split
+coefficient storage, sweep state, LU caches, worker scratch, idle policy,
+stats) and adds the θ-cutoff edge partition, per-leaf partial slot buffers
+`Y[i]` (`n_i × nslots[i]`; big edges ascending source, small aggregate last),
+the static per-worker task lists, and the sweep-scoped synchronization state:
+`published[j]` holds the sweep number in which leaf j last published
+(monotone within an inner-sweep block), `slotcnt[i]` counts slot arrivals
+(the last arriver finalizes inline), `ndone`/`ntasks` gate the sweep
+boundary. `sim_makespan`/`sim_edge_L` record the build-time schedule
+simulation (bytes; reporting only).
+"""
+struct DagEdgePlan{TM,TS,TF,TLU}
+    base::DagTeamPlan{TM,TS,TF,TLU}
+    theta::Int
+    nslots::Vector{Int}
+    smalls::Vector{Vector{Tuple{Int32,Int32}}}   # per leaf: (source j, col0), ascending j
+    Y::Vector{Matrix{TS}}
+    lists::Vector{Vector{DagEdgeTask}}           # per worker, simulated-start order
+    published::Vector{Threads.Atomic{Int}}
+    slotcnt::Vector{Threads.Atomic{Int}}
+    ndone::Threads.Atomic{Int}
+    ntasks::Int
+    sim_makespan::Float64
+    sim_edge_L::Float64
+end
+
 struct FastGaussSeidel{TF,Nsys,TIL,TLC,TDT} <: AbstractSolver
     self_matrices::Matrices{TF}
     leaf_lu_cache::TLC

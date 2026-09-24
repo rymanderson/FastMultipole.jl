@@ -42,12 +42,26 @@ active, which would otherwise starve the threaded FMM farfield pass.
 
 #------- precision-dispatched GEMV kernels -------#
 
-# same-precision: BLAS
-@inline dagteam_gemv!(y::AbstractVector{T}, A::Matrix{T}, x::AbstractVector{T}) where T = mul!(y, A, x)
+# same-precision: BLAS (AbstractMatrix admits the contiguous column-block
+# views used by the :dagedge edge tasks)
+@inline dagteam_gemv!(y::AbstractVector{T}, A::AbstractMatrix{T}, x::AbstractVector{T}) where T = mul!(y, A, x)
 
 # Float32 storage, Float64 state (:f32conv): convert on load, column-major
-function dagteam_gemv!(y::AbstractVector{Float64}, A::Matrix{Float32}, x::AbstractVector{Float64})
+function dagteam_gemv!(y::AbstractVector{Float64}, A::AbstractMatrix{Float32}, x::AbstractVector{Float64})
     fill!(y, 0.0)
+    @inbounds for jc in axes(A, 2)
+        s = x[jc]
+        @simd for k in eachindex(y)
+            y[k] = muladd(Float64(A[k, jc]), s, y[k])
+        end
+    end
+    return y
+end
+
+# accumulating variants (y += A x), used by the :dagedge small-edge aggregate
+@inline dagteam_gemv_acc!(y::AbstractVector{T}, A::AbstractMatrix{T}, x::AbstractVector{T}) where T = mul!(y, A, x, true, true)
+
+function dagteam_gemv_acc!(y::AbstractVector{Float64}, A::AbstractMatrix{Float32}, x::AbstractVector{Float64})
     @inbounds for jc in axes(A, 2)
         s = x[jc]
         @simd for k in eachindex(y)
