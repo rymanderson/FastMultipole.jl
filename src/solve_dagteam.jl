@@ -222,6 +222,10 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
     # segment, rows follow the branch's ascending global rows, i.e. whole
     # leaves lo:hi in ascending order (asserted above)
     for j in 1:n_leaves
+        # a source leaf with no direct blocks has nothing to repack; with an
+        # entirely empty direct list, nonself_matrices is EmptyMatrices (no
+        # per-leaf entries at all), so indexing it here would throw
+        isempty(index_map[j]) && continue
         mat, _ = get_matrix_vector(nonself_matrices, j)
         nj = nof(j)
         size(mat, 1) == 0 || size(mat, 2) == nj || throw(ArgumentError(

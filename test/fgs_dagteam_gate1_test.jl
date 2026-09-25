@@ -271,3 +271,36 @@ for precision in (:f32conv, :f32full)
 end
 
 end
+
+# --- 7. empty direct list (single-leaf tree) regression (2026-09-24) ---------
+# A leaf_size >= n tree has one leaf and ZERO direct blocks, so
+# nonself_influence_matrices returns EmptyMatrices (no per-leaf entries).
+# build_dagteam_plan used to index it per leaf and throw BoundsError — hit as
+# soon as :dagteam became the FLOWPanel FGSSolver default (tiny test bodies).
+@testset "FGS dagteam/dagedge: empty direct list (single leaf)" begin
+    for order in (:dagteam, :dagedge)
+        sys_ref = generate_gravitational(20260924, 50)
+        FastMultipole.direct!(sys_ref; scalar_potential=true, gradient=false)
+        sys_ref.potential[1, :] .*= -1.0
+        sys_dag = generate_gravitational(20260924, 50)
+        FastMultipole.direct!(sys_dag; scalar_potential=true, gradient=false)
+        sys_dag.potential[1, :] .*= -1.0
+        make1(o) = FastMultipole.FastGaussSeidel((o === :lex ? sys_ref : sys_dag,),
+            (o === :lex ? sys_ref : sys_dag,);
+            expansion_order=4, multipole_acceptance=0.5, leaf_size=100,
+            shrink=true, recenter=false,
+            sweep_order=(o === :lex ? :lexicographic : order))
+        fgs1_lex = make1(:lex)
+        @test length(fgs1_lex.source_tree.leaf_index) == 1
+        @test isempty(fgs1_lex.direct_list)
+        fgs1_dag = make1(order)   # regression: must not throw
+        for (sys, fgs) in ((sys_ref, fgs1_lex), (sys_dag, fgs1_dag))
+            FastMultipole.solve!((sys,), (sys,), fgs; scalar_potential=true,
+                gradient=false, max_iterations=50, inner_iterations=2,
+                tolerance=1e-10, verbose=false, final_update=false)
+        end
+        x_lex = [bd.strength[1] for bd in sys_ref.bodies]
+        x_dag = [bd.strength[1] for bd in sys_dag.bodies]
+        @test norm(x_dag .- x_lex, Inf) <= 1e-10 * max(1.0, norm(x_lex, Inf))
+    end
+end
