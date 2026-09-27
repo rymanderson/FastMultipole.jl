@@ -454,7 +454,7 @@ function dagedge_worker!(plan::DagEdgePlan, rt::DagTeamRuntime, w::Int)
 end
 
 function dagedge_start_team!(plan::DagEdgePlan)
-    rt = DagTeamRuntime(Threads.Atomic{Int}(0), Ref(false), Task[])
+    rt = DagTeamRuntime(Threads.Atomic{Int}(0), Ref(false), Task[], DagCoopTeam[])
     for w in 2:length(plan.lists)
         push!(rt.tasks, Threads.@spawn dagedge_worker!($plan, $rt, $w))
     end

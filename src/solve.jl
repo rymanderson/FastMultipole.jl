@@ -140,7 +140,7 @@ function restore_strengths!(source_buffers::AbstractVector{<:Matrix}, source_sys
     end
 end
 
-function nonself_influence_matrices(target_buffers::AbstractVector{<:Matrix}, source_buffers::AbstractVector{<:Matrix}, source_systems::Tuple, target_tree::Tree{TF,<:Any}, source_tree::Tree, direct_list, derivatives_switches) where TF
+function nonself_influence_matrices(target_buffers::AbstractVector{<:Matrix}, source_buffers::AbstractVector{<:Matrix}, source_systems::Tuple, target_tree::Tree{TF,<:Any}, source_tree::Tree, direct_list, derivatives_switches; setup_threads::Integer=0) where TF
 
     #--- sort by source ---#
 
@@ -239,6 +239,23 @@ function nonself_influence_matrices(target_buffers::AbstractVector{<:Matrix}, so
         matrices = Matrices(sizes, TF)
 
         #--- populate influence matrices ---#
+
+        # BRAINSTORM 033 B-R2: setup_threads >= 1 routes population through the
+        # parallel per-source-leaf path (worker-private buffer copies, disjoint
+        # matrix writes, per-column semantics identical to the serial loop
+        # below — bitwise-equal blocks at any worker count). setup_threads = 0
+        # (the default) is the legacy serial path, byte-for-byte unchanged.
+        if setup_threads >= 1
+            _populate_nonself_threaded!(matrices, matrix_map, sorted_list,
+                target_branches, source_branches, target_buffers,
+                source_buffers, source_systems, derivatives_switches,
+                setup_threads)
+
+            # zero rhs
+            matrices.rhs .= zero(TF)
+
+            return matrices, sorted_list
+        end
 
         # store strengths for later
         old_strengths = save_strengths(source_buffers, source_systems)
@@ -345,6 +362,127 @@ function nonself_influence_matrices(target_buffers::AbstractVector{<:Matrix}, so
     return matrices, sorted_list
 end
 
+# BRAINSTORM 033 B-R2 (threaded FGS setup): parallel population of the
+# non-self influence matrices. One matrix per source leaf; matrix writes are
+# disjoint across leaves, so workers pull whole matrices from an atomic
+# counter. `reset!`/`direct!` mutate target buffers and the unit-strength
+# probe reads source buffers whose branch body ranges are shared across
+# matrices, so each worker probes on PRIVATE copies of both buffer sets
+# (copied AFTER unit strengths are set). Every column is computed by exactly
+# the same reset!/direct!/influence! sequence as the serial loop in
+# `nonself_influence_matrices`, so the result is bitwise identical at any
+# worker count.
+function _populate_nonself_threaded!(matrices, matrix_map, sorted_list,
+        target_branches, source_branches, target_buffers, source_buffers,
+        source_systems, derivatives_switches, n_threads)
+
+    # group sorted_list (already source-sorted) into one contiguous range per
+    # non-empty matrix
+    n_matrices = length(matrix_map)
+    group_ranges = Vector{UnitRange{Int}}(undef, n_matrices)
+    i_group = 0
+    g_start = 1
+    this_source = 0
+    for (i, (_, j_source)) in enumerate(sorted_list)
+        if j_source != this_source
+            i_group > 0 && (group_ranges[i_group] = g_start:i-1)
+            i_group += 1
+            g_start = i
+            this_source = j_source
+        end
+    end
+    group_ranges[i_group] = g_start:length(sorted_list)
+    @assert i_group == n_matrices "source-leaf group count $(i_group) does not match matrix_map length $(n_matrices)"
+
+    # store strengths for later, set unit strengths on the SHARED buffers
+    # (worker copies inherit them), restore after the parallel region
+    old_strengths = save_strengths(source_buffers, source_systems)
+    set_unit_strength!(source_buffers, source_systems)
+
+    n_workers = min(Int(n_threads), n_matrices)
+    next_group = Threads.Atomic{Int}(0)
+    GC.@preserve matrices @sync for _ in 1:n_workers
+        Threads.@spawn begin
+            local_targets = map(copy, target_buffers)
+            local_sources = map(copy, source_buffers)
+            while true
+                i_matrix = Threads.atomic_add!(next_group, 1) + 1
+                i_matrix > n_matrices && break
+                matrix, influence = get_matrix_vector(matrices, matrix_map[i_matrix])
+                _populate_nonself_group!(matrix, influence,
+                    view(sorted_list, group_ranges[i_matrix]),
+                    target_branches, source_branches, local_targets,
+                    local_sources, source_systems, derivatives_switches)
+            end
+        end
+    end
+
+    restore_strengths!(source_buffers, source_systems, old_strengths)
+
+    return nothing
+end
+
+# populate ONE non-self matrix (all direct-list entries of one source leaf);
+# faithful replay of the serial per-entry logic in
+# `nonself_influence_matrices` (including the multi-system row-cursor
+# semantics) on the worker's private buffers
+function _populate_nonself_group!(matrix, influence, list_group,
+        target_branches, source_branches, target_buffers, source_buffers,
+        source_systems, derivatives_switches)
+
+    i_target_start = 1
+    for (i_target, j_source) in list_group
+
+        # every source system's column block spans the SAME target rows;
+        # track them with a per-system cursor and advance the shared segment
+        # start only once (mirrors the serial multi-system BoundsError fix)
+        this_i_source_start = 1
+        seg_target_start = i_target_start
+        row_cursor = i_target_start
+
+        for i_source_system in eachindex(source_systems)
+
+            # reset to the segment's first row for this column block
+            row_cursor = seg_target_start
+
+            source_index = source_branches[j_source].bodies_index[i_source_system]
+            n_sources = length(source_index)
+            source_system = source_systems[i_source_system]
+            source_buffer = source_buffers[i_source_system]
+
+            for i_target_system in eachindex(target_buffers)
+
+                target_index = target_branches[i_target].bodies_index[i_target_system]
+                n_targets = length(target_index)
+                this_matrix = view(matrix, row_cursor:row_cursor + n_targets - 1, this_i_source_start:this_i_source_start + n_sources - 1)
+                this_influence = view(influence, row_cursor:row_cursor + n_targets - 1)
+
+                target_buffer = target_buffers[i_target_system]
+                this_target_buffer = view(target_buffer, :, target_index)
+                target_source_buffer = source_buffers[i_target_system]
+                this_source_buffer = view(target_source_buffer, :, target_index)
+                derivatives_switch = derivatives_switches[i_target_system]
+
+                # loop over source bodies: same probe as the serial path
+                for (isb, i_source_body) in enumerate(source_index)
+                    reset!(target_buffer, target_index)
+                    direct!(target_buffer, target_index, derivatives_switch, source_system, source_buffer, i_source_body:i_source_body)
+                    influence!(this_influence, this_target_buffer, derivatives_switch, source_system, this_source_buffer)
+                    this_matrix[:, isb] .= this_influence
+                end
+
+                row_cursor += n_targets
+            end
+
+            this_i_source_start += n_sources
+        end
+
+        i_target_start = row_cursor
+    end
+
+    return nothing
+end
+
 """
     index_by_source(sorted_list::Vector{SVector{2,Int}}, leaf_index::Vector{Int})
 
@@ -436,7 +574,7 @@ end
 
 Constructs influence matrices for all leaves of the tree. (Assumes source tree and target trees are identical.)
 """
-function self_influence_matrices(target_buffers, source_buffers, source_systems, target_tree::Tree{TF,<:Any}, source_tree, derivatives_switches) where TF
+function self_influence_matrices(target_buffers, source_buffers, source_systems, target_tree::Tree{TF,<:Any}, source_tree, derivatives_switches; setup_threads::Integer=0) where TF
 
     #--- pre-allocate influence matrices ---#
 
@@ -451,6 +589,16 @@ function self_influence_matrices(target_buffers, source_buffers, source_systems,
     matrices = Matrices(sizes, TF)
 
     #--- populate influence matrices ---#
+
+    # BRAINSTORM 033 B-R2: parallel per-leaf population (worker-private buffer
+    # copies, disjoint matrix writes, bitwise-equal to the serial loop below);
+    # setup_threads = 0 (default) is the legacy serial path, unchanged.
+    if setup_threads >= 1
+        _populate_self_threaded!(matrices, source_tree, target_buffers,
+            source_buffers, source_systems, derivatives_switches, setup_threads)
+        matrices.rhs .= zero(TF)
+        return matrices
+    end
 
     # store strengths for later
     old_strengths = save_strengths(source_buffers, source_systems)
@@ -523,6 +671,81 @@ function self_influence_matrices(target_buffers, source_buffers, source_systems,
     matrices.rhs .= zero(TF)
 
     return matrices
+end
+
+# BRAINSTORM 033 B-R2 (threaded FGS setup): parallel population of the leaf
+# self-influence matrices — one matrix per leaf, disjoint writes, workers on
+# private buffer copies (same argument as `_populate_nonself_threaded!`).
+function _populate_self_threaded!(matrices, source_tree, target_buffers,
+        source_buffers, source_systems, derivatives_switches, n_threads)
+
+    old_strengths = save_strengths(source_buffers, source_systems)
+    set_unit_strength!(source_buffers, source_systems)
+
+    n_leaves = length(source_tree.leaf_index)
+    n_workers = min(Int(n_threads), n_leaves)
+    next_leaf = Threads.Atomic{Int}(0)
+    GC.@preserve matrices @sync for _ in 1:n_workers
+        Threads.@spawn begin
+            local_targets = map(copy, target_buffers)
+            local_sources = map(copy, source_buffers)
+            while true
+                i_matrix = Threads.atomic_add!(next_leaf, 1) + 1
+                i_matrix > n_leaves && break
+                _populate_self_leaf!(matrices, i_matrix,
+                    source_tree.branches[source_tree.leaf_index[i_matrix]],
+                    local_targets, local_sources, source_systems,
+                    derivatives_switches)
+            end
+        end
+    end
+
+    restore_strengths!(source_buffers, source_systems, old_strengths)
+
+    return nothing
+end
+
+# populate ONE leaf self-influence matrix; faithful replay of the serial
+# per-leaf logic in `self_influence_matrices` on the worker's private buffers
+function _populate_self_leaf!(matrices, i_matrix, branch, target_buffers,
+        source_buffers, source_systems, derivatives_switches)
+
+    matrix, influence = get_matrix_vector(matrices, i_matrix)
+
+    i_source_start = 0
+    for i_source_system in eachindex(source_systems)
+
+        source_system = source_systems[i_source_system]
+        source_buffer = source_buffers[i_source_system]
+        source_bodies_index = branch.bodies_index[i_source_system]
+
+        i_target_start = 1
+        for i_target_system in eachindex(target_buffers)
+
+            target_buffer = target_buffers[i_target_system]
+            derivatives_switch = derivatives_switches[i_target_system]
+            target_bodies_index = branch.bodies_index[i_target_system]
+
+            n_targets = length(target_bodies_index)
+            this_influence = view(influence, i_target_start:i_target_start + n_targets - 1)
+
+            targets_view = view(target_buffer, :, target_bodies_index)
+            sources_view = view(source_buffer, :, source_bodies_index)
+            this_matrix_block = view(matrix, i_target_start:i_target_start + n_targets - 1, i_source_start + 1:i_source_start + length(source_bodies_index))
+            for (isb, i_source_body) in enumerate(source_bodies_index)
+                reset!(target_buffer, target_bodies_index)
+                direct!(target_buffer, target_bodies_index, derivatives_switch, source_system, source_buffer, i_source_body:i_source_body)
+                influence!(this_influence, targets_view, derivatives_switch, source_system, sources_view)
+                this_matrix_block[:, isb] .= this_influence
+            end
+
+            i_target_start += length(branch.bodies_index[i_target_system])
+        end
+
+        i_source_start += length(source_bodies_index)
+    end
+
+    return nothing
 end
 
 """
@@ -627,7 +850,9 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
     extra_farfield=false, cache_leaf_lu::Bool=true,
     sweep_order::Symbol=:lexicographic, chunks::Int=64,
     dagteam_precision::Symbol=:f64, dagteam_workers::Int=0,
-    dagteam_idle::Symbol=:spin, dagedge_theta::Int=4096
+    dagteam_idle::Symbol=:spin, dagteam_coop::Int=1, dagedge_theta::Int=4096,
+    threaded_setup::Bool=false  # BRAINSTORM 033 B-R2: parallel influence-matrix
+                                # population (bitwise-equal blocks); default off
 )
     sweep_order in (:lexicographic, :colored, :chunked, :dagteam, :dagedge) || throw(ArgumentError(
         "sweep_order must be :lexicographic, :colored, :chunked, :dagteam, or :dagedge (got $(repr(sweep_order)))"))
@@ -684,7 +909,8 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
 
     #--- build non-self influence matrices ---#
 
-    nonself_matrices, sorted_list = nonself_influence_matrices(target_tree.buffers, source_tree.buffers, source_systems, target_tree, source_tree, direct_list, derivatives_switches)
+    setup_threads = threaded_setup ? Threads.nthreads() : 0
+    nonself_matrices, sorted_list = nonself_influence_matrices(target_tree.buffers, source_tree.buffers, source_systems, target_tree, source_tree, direct_list, derivatives_switches; setup_threads)
     old_influence_storage = similar(nonself_matrices.rhs)
 
     #--- full direct list includes leaf-on-self interactions ---#
@@ -697,7 +923,7 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
 
     #--- build self-influence matrices ---#
 
-    self_matrices = self_influence_matrices(target_tree.buffers, source_tree.buffers, source_systems, target_tree, source_tree, derivatives_switches)
+    self_matrices = self_influence_matrices(target_tree.buffers, source_tree.buffers, source_systems, target_tree, source_tree, derivatives_switches; setup_threads)
     leaf_lu_cache = cache_leaf_lu ? build_leaf_lu_cache(self_matrices) : nothing
 
     #--- source strength vector ---#
@@ -770,7 +996,7 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
             build_dagteam_plan(dagteam_precision, nonself_matrices,
                 sorted_list, index_map, source_tree, target_tree,
                 strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache;
-                nworkers, idle_policy=dagteam_idle) :
+                nworkers, idle_policy=dagteam_idle, coop=dagteam_coop) :
             build_dagedge_plan(dagteam_precision, nonself_matrices,
                 sorted_list, index_map, source_tree, target_tree,
                 strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache;

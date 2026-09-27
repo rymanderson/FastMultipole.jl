@@ -1180,6 +1180,23 @@ struct DagTeamPlan{TM,TS,TF,TLU}
     # per-worker gather/product scratch (length = nthreads at construction)
     xg::Vector{Vector{TS}}
     yb::Vector{Vector{TS}}
+    # cooperative leaf-product teams (BRAINSTORM 033 A-R2 prototype).
+    # teamw[] = current team width w (workers per cooperative team); 1 = solo,
+    # the production dagteam behavior (bit-identical — no coop code runs).
+    # Mutable Ref so paired same-process arms can toggle width between solves
+    # on ONE plan; worker teams are (re)built per inner-sweep block, so a
+    # toggle between solves is always safe. teamw_cap sizes the scratch below
+    # at construction (`coop` kwarg of build_dagteam_plan); dagteam_start_team!
+    # errors if teamw[] exceeds it. When teamw[] > 1 the nw workers are grouped
+    # into fld(nw, teamw) teams of teamw (leftovers run solo); each team's
+    # publisher pops tasks and performs the b−y−u update, cached LU solve, and
+    # successor publication alone, while teammates compute contiguous-column
+    # partial GEMVs (A-T1 column clause: exact-arithmetic equivalent,
+    # deterministic fixed-order reduction, NOT bitwise vs solo).
+    teamw::Base.RefValue{Int}
+    teamw_cap::Int
+    xgt::Vector{Vector{TS}}   # per-team shared gather buffers (length max_ptot); empty when teamw_cap == 1
+    qb::Vector{Vector{TS}}    # per-worker back-product partial scratch (length max_mup); empty when teamw_cap == 1
     # scheduler state (reset each sweep)
     indeg::Vector{Int}
     readyQ::Vector{Int}

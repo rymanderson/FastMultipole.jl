@@ -114,6 +114,11 @@ join active-team barriers. Clamped to `1:Threads.nthreads()`. Completion is
 an atomic task counter over a shared queue (not a fixed-arrival barrier), so
 any team size drains the same queue without deadlock.
 
+`coop` (033 A-R2 prototype) sets the cooperative team width `teamw_cap` and
+the initial `teamw[]` (see `DagTeamPlan`): 1 (default) is the solo production
+executor, bit-identical to the pre-coop behavior; widths 2 and 4 are the
+measured A-R1 operating points (any 1 ≤ coop ≤ nworkers is accepted).
+
 `idle_policy` selects what a worker does when both queues are empty:
 `:spin` (default, production) busy-polls the queue lock; `:backoff` pauses
 in a bounded exponential loop gated on the `qhint` atomic queue-length hint,
@@ -130,7 +135,8 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
         targets_by_branch::Vector{UnitRange{Int}},
         self_matrices::Matrices{TF}, leaf_lu_cache;
         nworkers::Integer=Threads.nthreads(),
-        idle_policy::Symbol=:spin) where TF
+        idle_policy::Symbol=:spin,
+        coop::Integer=1) where TF
 
     precision in (:f64, :f32conv, :f32full) || throw(ArgumentError(
         "dagteam_precision must be :f64, :f32conv, or :f32full (got $(repr(precision)))"))
@@ -292,6 +298,20 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
     xg = [zeros(TS, max_ptot) for _ in 1:nw]
     yb = [zeros(TS, max_n) for _ in 1:nw]
 
+    # cooperative-team scratch (033 A-R2): capacity for any width 2..teamw_cap
+    # — at width w there are fld(nw, w) teams, maximized at w=2. Solo builds
+    # (coop=1, the default) allocate nothing.
+    coop >= 1 || throw(ArgumentError("dagteam coop must be >= 1 (got $coop)"))
+    teamw_cap = clamp(Int(coop), 1, nw)
+    if teamw_cap > 1
+        max_mup = max(1, maximum(mup; init=1))
+        xgt = [zeros(TS, max_ptot) for _ in 1:fld(nw, 2)]
+        qb = [zeros(TS, max_mup) for _ in 1:nw]
+    else
+        xgt = Vector{TS}[]
+        qb = Vector{TS}[]
+    end
+
     if TS === TF
         leaf_lu_cache isa LeafLUCache || throw(ArgumentError(
             "sweep_order=:dagteam requires cache_leaf_lu=true"))
@@ -307,7 +327,9 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
 
     return DagTeamPlan{TM,TS,TF,typeof(lus)}(preds, nsucc, uppers, prio, indeg0,
         roots, ptot, mup, Lmat, Umat, red, offset, x, b, u, lsum, q,
-        external_rhs, lus, xg, yb, indeg, readyQ, backQ, Threads.SpinLock(),
+        external_rhs, lus, xg, yb,
+        Ref(teamw_cap), teamw_cap, xgt, qb,
+        indeg, readyQ, backQ, Threads.SpinLock(),
         Threads.Atomic{Int}(0), ntasks, idle_policy, Threads.Atomic{Int}(0),
         [DagWorkerStats() for _ in 1:nw], Ref(false))
 end
@@ -334,10 +356,13 @@ end
     return yv
 end
 
-function dagteam_do_lower!(plan::DagTeamPlan{TM,TS}, w::Int, i::Int) where {TM,TS}
+# post-pull tail shared bit-identically by the solo and cooperative lower
+# paths: save Lx, form b − y − u, solve the cached LU in place, publish
+# successors under the queue lock, and count completion
+@inline function dagteam_finish_lower!(plan::DagTeamPlan{TM,TS}, i::Int,
+        yv::AbstractVector{TS}) where {TM,TS}
     base = plan.offset[i]
     n = plan.offset[i + 1] - base
-    yv = dagteam_pull!(plan, w, i)
     xv = view(plan.x, base + 1:base + n)
     @inbounds for k in 1:n
         plan.lsum[base + k] = yv[k]                       # saved: Lx at this sweep
@@ -357,11 +382,191 @@ function dagteam_do_lower!(plan::DagTeamPlan{TM,TS}, w::Int, i::Int) where {TM,T
     return nothing
 end
 
+function dagteam_do_lower!(plan::DagTeamPlan{TM,TS}, w::Int, i::Int) where {TM,TS}
+    yv = dagteam_pull!(plan, w, i)
+    dagteam_finish_lower!(plan, i, yv)
+    return nothing
+end
+
 # backward product q_j = U_j x_j at the source's current (post-solve) strengths
 @inline function dagteam_do_back_product!(plan::DagTeamPlan, j::Int)
     xv = view(plan.x, plan.offset[j] + 1:plan.offset[j + 1])
     dagteam_gemv!(plan.q[j], plan.Umat[j], xv)
     return nothing
+end
+
+#------- cooperative leaf products (BRAINSTORM 033 A-R2 prototype) -------#
+#
+# When plan.teamw[] > 1, workers are grouped into static teams of tw: the
+# team's PUBLISHER runs the ordinary drain loop (pops tasks, does the b−y−u
+# update, cached LU solve and publication alone), and its tw−1 TEAMMATES are
+# dedicated helpers that never touch the queues. A popped GEMV task (lower
+# pull or backward product) is executed cooperatively in the A-R1-selected
+# COLUMN layout: contiguous column blocks (fixed even partition, member m of
+# 0..tw−1 owns block m) into private per-member partial vectors, then a fixed
+# ascending-member-order reduction by the publisher — deterministic for fixed
+# width/partition, exact-arithmetic equivalent to the solo GEMV (A-T1 column
+# clause; NOT bitwise). Publisher/teammate handoff is a seq/arrived atomic
+# protocol; all spin waits are GC-safepointed with a rare bounded-yield escape
+# (A-R1 harness lesson: required to avoid GC/scheduler deadlock).
+#
+# Memory ordering: the publisher popped the task under plan.qlock, whose
+# acquire pairs with the lock release that published every predecessor's
+# strengths, so the publisher sees the finalized plan.x; the publisher's
+# seq_cst store of job/seq followed by the teammate's seq_cst load of seq
+# extends that happens-before edge to the teammates. Teammate partial writes
+# happen-before their atomic arrived increment, which the publisher's
+# acquire-read of arrived pairs with before reducing.
+
+struct DagCoopTeam
+    tw::Int                       # team width (workers per team)
+    t::Int                        # team index (selects plan.xgt[t])
+    pub::Int                      # publisher's worker index; member m uses scratch pub + m
+    job::Threads.Atomic{Int}      # +i = lower pull of leaf i; −j = backward product of source j
+    seq::Threads.Atomic{Int}      # job epoch; teammates run one job per increment
+    arrived::Threads.Atomic{Int}  # teammate completions for the current job
+    stop::Threads.Atomic{Bool}
+end
+DagCoopTeam(tw::Int, t::Int, pub::Int) = DagCoopTeam(tw, t, pub,
+    Threads.Atomic{Int}(0), Threads.Atomic{Int}(0), Threads.Atomic{Int}(0),
+    Threads.Atomic{Bool}(false))
+
+# split selection (A-T3 practical rule): A-R1 measured every real R4 leaf
+# shape down to p25 clearing the split threshold at w=2 and w=4 (effective
+# h_w ≈ 0.4–3 µs vs products ≥ 10 µs), so the prototype splits essentially
+# every product — the only guard is a degeneracy floor of two columns per
+# member so no member ever owns an empty block. Deliberately NOT restricted
+# to hot leaves (A-T3 binding note).
+@inline dagteam_coop_eligible(ncols::Int, tw::Int) = ncols >= 2 * tw
+
+# member m's contiguous column block of 1:ncols (fixed even partition —
+# deterministic for fixed width)
+@inline function dagteam_coop_cols(ncols::Int, tw::Int, m::Int)
+    return (div(ncols * m, tw) + 1):div(ncols * (m + 1), tw)
+end
+
+# GC-cooperative spin until `at[] >= target` (publisher waiting on arrivals)
+@inline function dagteam_coop_wait!(at::Threads.Atomic{Int}, target::Int)
+    spins = 0
+    while at[] < target
+        GC.safepoint()
+        ccall(:jl_cpu_pause, Cvoid, ())
+        spins += 1
+        spins < 10_000 || (yield(); spins = 0)
+    end
+    return nothing
+end
+
+# member m's lower partial for leaf i: gather this member's column slice of
+# the ascending-predecessor state into the team's SHARED gather buffer
+# (members write disjoint ranges) and compute the private partial
+# y^{(m)} = Lmat[i][:, cols] * xgt[cols] into yb[pub + m]
+function dagteam_coop_lower_partial!(plan::DagTeamPlan{TM,TS}, xgt::Vector{TS},
+        i::Int, w_scratch::Int, m::Int, tw::Int) where {TM,TS}
+    cols = dagteam_coop_cols(plan.ptot[i], tw, m)
+    off = 0
+    @inbounds for j in plan.preds[i]
+        nj = plan.offset[j + 1] - plan.offset[j]
+        lo = max(off + 1, first(cols))
+        hi = min(off + nj, last(cols))
+        lo <= hi && copyto!(xgt, lo, plan.x, plan.offset[j] + (lo - off), hi - lo + 1)
+        off += nj
+        off >= last(cols) && break
+    end
+    n = plan.offset[i + 1] - plan.offset[i]
+    yv = view(plan.yb[w_scratch], 1:n)
+    dagteam_gemv!(yv, view(plan.Lmat[i], :, cols), view(xgt, cols))
+    return nothing
+end
+
+# member m's backward-product partial for source j: column block of the
+# source's own strengths; member 0 (publisher) writes q[j] directly, members
+# m > 0 write private partials in qb[pub + m]
+function dagteam_coop_back_partial!(plan::DagTeamPlan{TM,TS}, j::Int,
+        w_scratch::Int, m::Int, tw::Int) where {TM,TS}
+    nj = plan.offset[j + 1] - plan.offset[j]
+    cols = dagteam_coop_cols(nj, tw, m)
+    xv = view(plan.x, plan.offset[j] + first(cols):plan.offset[j] + last(cols))
+    A = view(plan.Umat[j], :, cols)
+    if m == 0
+        dagteam_gemv!(plan.q[j], A, xv)
+    else
+        dagteam_gemv!(view(plan.qb[w_scratch], 1:plan.mup[j]), A, xv)
+    end
+    return nothing
+end
+
+# publisher side: dispatch the job to the team, compute member 0's own
+# partial, wait for the teammates, and reduce in fixed ascending member order
+@inline function dagteam_coop_dispatch!(coop::DagCoopTeam, job::Int)
+    coop.arrived[] = 0
+    coop.job[] = job
+    Threads.atomic_add!(coop.seq, 1)
+    return nothing
+end
+
+function dagteam_coop_do_lower!(plan::DagTeamPlan{TM,TS}, coop::DagCoopTeam,
+        i::Int) where {TM,TS}
+    tw = coop.tw
+    dagteam_coop_dispatch!(coop, i)
+    dagteam_coop_lower_partial!(plan, plan.xgt[coop.t], i, coop.pub, 0, tw)
+    dagteam_coop_wait!(coop.arrived, tw - 1)
+    n = plan.offset[i + 1] - plan.offset[i]
+    yv = view(plan.yb[coop.pub], 1:n)
+    @inbounds for m in 1:tw - 1                 # fixed ascending block order
+        pv = plan.yb[coop.pub + m]
+        @simd for k in 1:n
+            yv[k] += pv[k]
+        end
+    end
+    dagteam_finish_lower!(plan, i, yv)
+    return nothing
+end
+
+function dagteam_coop_do_back!(plan::DagTeamPlan{TM,TS}, coop::DagCoopTeam,
+        j::Int) where {TM,TS}
+    tw = coop.tw
+    dagteam_coop_dispatch!(coop, -j)
+    dagteam_coop_back_partial!(plan, j, coop.pub, 0, tw)
+    dagteam_coop_wait!(coop.arrived, tw - 1)
+    qj = plan.q[j]
+    mupj = plan.mup[j]
+    @inbounds for m in 1:tw - 1                 # fixed ascending block order
+        pv = plan.qb[coop.pub + m]
+        @simd for k in 1:mupj
+            qj[k] += pv[k]
+        end
+    end
+    return nothing
+end
+
+# dedicated teammate loop (member m of coop's team, worker index coop.pub+m):
+# one job per seq increment. my_seq starts at the constructed value 0; the
+# publisher cannot advance seq past a job until every teammate has arrived,
+# so no job is ever skipped even if this task is scheduled late (the
+# publisher's bounded-yield wait cedes the CPU until it runs).
+function dagteam_teammate!(plan::DagTeamPlan, coop::DagCoopTeam, m::Int)
+    w_scratch = coop.pub + m
+    tw = coop.tw
+    my_seq = 0
+    while true
+        spins = 0
+        while coop.seq[] == my_seq
+            coop.stop[] && return nothing
+            GC.safepoint()
+            ccall(:jl_cpu_pause, Cvoid, ())
+            spins += 1
+            spins < 10_000 || (yield(); spins = 0)
+        end
+        my_seq += 1
+        job = coop.job[]
+        if job > 0
+            dagteam_coop_lower_partial!(plan, plan.xgt[coop.t], job, w_scratch, m, tw)
+        else
+            dagteam_coop_back_partial!(plan, -job, w_scratch, m, tw)
+        end
+        Threads.atomic_add!(coop.arrived, 1)
+    end
 end
 
 # target-owned boundary reduction, serial in fixed ascending source order
@@ -398,7 +603,8 @@ end
 #   lockmgmt_ns — busy-path lock+pop time (acquisitions on the critical path);
 #   idle_ns     — empty-pop streaks, timed at the streak boundaries only;
 #   busy_*_ns   — task bodies (do_lower! includes its publish lock).
-function dagteam_drain!(plan::DagTeamPlan, w::Int)
+function dagteam_drain!(plan::DagTeamPlan, w::Int,
+        coop::Union{Nothing,DagCoopTeam}=nothing)
     backoff = plan.idle_policy === :backoff
     cs = plan.collect_stats[]
     st = plan.stats[w]
@@ -446,11 +652,20 @@ function dagteam_drain!(plan::DagTeamPlan, w::Int)
             end
             t1 = cs ? time_ns() : UInt64(0)
             if isback
-                dagteam_do_back_product!(plan, task)
+                nj = plan.offset[task + 1] - plan.offset[task]
+                if coop !== nothing && dagteam_coop_eligible(nj, coop.tw)
+                    dagteam_coop_do_back!(plan, coop, task)
+                else
+                    dagteam_do_back_product!(plan, task)
+                end
                 Threads.atomic_add!(plan.ndone, 1)
                 cs && (st.busy_back_ns += time_ns() - t1; st.n_back += 1)
             else
-                dagteam_do_lower!(plan, w, task)
+                if coop !== nothing && dagteam_coop_eligible(plan.ptot[task], coop.tw)
+                    dagteam_coop_do_lower!(plan, coop, task)
+                else
+                    dagteam_do_lower!(plan, w, task)
+                end
                 cs && (st.busy_lower_ns += time_ns() - t1; st.n_lower += 1)
             end
         end
@@ -465,9 +680,11 @@ mutable struct DagTeamRuntime
     epoch::Threads.Atomic{Int}
     stop::Base.RefValue{Bool}
     tasks::Vector{Task}
+    coops::Vector{DagCoopTeam}   # empty at teamw[] == 1 (solo, production)
 end
 
-function dagteam_worker!(plan::DagTeamPlan, rt::DagTeamRuntime, w::Int)
+function dagteam_worker!(plan::DagTeamPlan, rt::DagTeamRuntime, w::Int,
+        coop::Union{Nothing,DagCoopTeam}=nothing)
     my_epoch = 0
     while true
         while rt.epoch[] == my_epoch
@@ -476,20 +693,47 @@ function dagteam_worker!(plan::DagTeamPlan, rt::DagTeamRuntime, w::Int)
             ccall(:jl_cpu_pause, Cvoid, ())
         end
         my_epoch += 1
-        dagteam_drain!(plan, w)
+        dagteam_drain!(plan, w, coop)
     end
 end
 
+# teamw[] == 1 (production default): identical to the historical team —
+# workers 2..nw all run the solo drain loop. teamw[] = tw > 1: workers are
+# grouped into fld(nw, tw) static teams of tw consecutive indices; worker
+# (t−1)tw+1 is team t's publisher (worker 1 = coordinator = team 1's
+# publisher), the following tw−1 are its dedicated teammates, and any
+# leftover workers (nw mod tw) run the solo drain loop. NOTE (A-T1
+# determinism clause): with leftovers present, an eligible task computes as
+# one GEMV (solo pop) or as a block-split reduction (team pop) depending on
+# which worker wins the pop, so run-to-run bitwise reproducibility is only
+# guaranteed when nw % tw == 0 (all A-R2-validated configurations);
+# exact-arithmetic equivalence and certified accuracy hold either way.
 function dagteam_start_team!(plan::DagTeamPlan)
-    rt = DagTeamRuntime(Threads.Atomic{Int}(0), Ref(false), Task[])
-    for w in 2:length(plan.xg)
-        push!(rt.tasks, Threads.@spawn dagteam_worker!($plan, $rt, $w))
+    nw = length(plan.xg)
+    tw = plan.teamw[]
+    1 <= tw <= plan.teamw_cap || throw(ArgumentError(
+        "dagteam teamw[] = $tw outside 1:$(plan.teamw_cap) (teamw_cap fixed at construction — rebuild with a larger coop)"))
+    nteams = tw > 1 ? fld(nw, tw) : 0
+    coops = [DagCoopTeam(tw, t, (t - 1) * tw + 1) for t in 1:nteams]
+    rt = DagTeamRuntime(Threads.Atomic{Int}(0), Ref(false), Task[], coops)
+    for w in 2:nw
+        t, m = fldmod(w - 1, max(tw, 1))          # team t+1, member m of it
+        if tw > 1 && t < nteams && m > 0
+            coop = coops[t + 1]
+            push!(rt.tasks, Threads.@spawn dagteam_teammate!($plan, $coop, $m))
+        else
+            coop = (tw > 1 && t < nteams && m == 0) ? coops[t + 1] : nothing
+            push!(rt.tasks, Threads.@spawn dagteam_worker!($plan, $rt, $w, $coop))
+        end
     end
     return rt
 end
 
 function dagteam_stop_team!(rt::DagTeamRuntime)
     rt.stop[] = true
+    for coop in rt.coops
+        coop.stop[] = true
+    end
     foreach(wait, rt.tasks)
     return nothing
 end
@@ -511,7 +755,7 @@ function dagteam_sweep!(plan::DagTeamPlan, rt::DagTeamRuntime, diagnostics=nothi
     plan.qhint[] = length(plan.readyQ)
     unlock(plan.qlock)
     Threads.atomic_add!(rt.epoch, 1)
-    dagteam_drain!(plan, 1)
+    dagteam_drain!(plan, 1, isempty(rt.coops) ? nothing : rt.coops[1])
     t_stage = diagnostics === nothing ? UInt64(0) : time_ns()
     while plan.ndone[] < plan.ntasks   # laggard finishing its last task body
         GC.safepoint()
