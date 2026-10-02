@@ -302,6 +302,79 @@ HPC.md`, local copy authoritative) is REQUIRED READING before cluster work.
   candidates into 053). Storage flag intensified: this run wrote full
   VTK under the shared data root while /home is already ~618G vs the
   400G cap — archiver pass needed (Ryan-gated).
+- 2026-09-15 — **Kutta :jump regression in 7fbd68a ISOLATED, scope
+  PRODUCTION-AFFECTING, legacy behavior RESTORED (fix local,
+  uncommitted).** Hunk-level bisect (worktrees at 7fbd68a^/7fbd68a,
+  dev-pathed FastMultipole+FLOWVPM): offending hunk is the tuple
+  `solve!` Dirichlet self-solve block in `src/FLOWPanel_solver.jl`
+  (diff hunk `@@ -2371,8 +2449,21`), causal sub-change = the loop-top
+  `body.potential .= prev_potential[i]` seeding: tuple solve! treats a
+  body's ENTRY potential as an external incident potential (phi_ext,
+  matching BackslashCoupled's design, which saves phi_ext, zeroes, and
+  adds it back into the Dirichlet RHS), but the legacy simulate!/kutta
+  VTS path enters with the previous step's STALE evaluated potential —
+  which the pre-7fbd68a single-body Dirichlet `solve!` zeroed as
+  workspace. SCOPE INVERSION vs the 09-04 reading: the LEGACY default
+  path itself changed at 7fbd68a (probe wake strengths -0.6448 vs
+  parent -0.3129, ~2x from the RHS re-adding the body's own converged
+  potential); the :jump fallback had kept producing parent-legacy
+  values (to 1 ulp). Production-affecting: every post-7fbd68a VTS
+  tuple solve (incl. 2r rotor+ground) ran with a
+  stale-potential-contaminated Dirichlet RHS. FIX (design-consistent,
+  caller-level): zero `body.potential` for all bodies in
+  `solve_formulation!(::VelocityThroughSources)` tuple branch before
+  tuple `solve!` (`src/FLOWPanel_formulation.jl` :946 region, +9
+  lines) — VTS has no external potential; phi_ext semantics preserved
+  for formulations/tests that deliberately supply one. Rejected fix:
+  zeroing at the solve! loop top restores kutta bitwise but breaks the
+  phi_ext design (coupled-oracle solver test then stalls at residual
+  0.03 = the test's seeded phi_ext). VALIDATION: at 7fbd68a+fix,
+  legacy==fallback bitwise and == parent legacy to 1 ulp (cross-commit
+  1-ulp drift from unrelated reordering in the commit; within-run
+  bitwise contract intact); at HEAD (1b59af5)+fix: kutta 658/658
+  (was 2 failures), solver 489/489 (incl. coupled oracle),
+  formulation 956/956. Fix left UNCOMMITTED in the local FLOWPanel
+  checkout per commit policy. LEAD for item 058: gsdiag's 5.8224e-4
+  residual plateau predates this fix's removal of stale phi_ext from
+  production 2r — re-run the 2r residual diagnostic after this fix
+  before deeper operator-mismatch work (speculative, cheap
+  discriminator). NOTE: post-7fbd68a 2r/GS results (incl. gsdiag
+  residual numbers) are not trajectory-comparable to post-fix runs.
+- 2026-09-15 — Kutta fix COMMITTED (Ryan-approved): `dd5573c` on
+  `fastmultipole`, local FLOWPanel checkout only (orc checkouts/silos
+  NOT yet updated). The start-prompt line saying the fix is
+  uncommitted is superseded by this entry.
+- 2026-09-15b — **Extended-revs 1r SPECIFICS RULED (Ryan): 25 revs**, not
+  45–60 ("go for 25 revs for now; if it hasn't settled, we can warmstart
+  later"); gate relaxed via new env `P022G_CASE_TIME_GATE_S` (default
+  keeps 7200); new carrier mode `accept_ext` (schedule 1.0+1.5+4.0+18.5,
+  954 steps); CONVERGENCE_REVS stays 10 → window = revs 16–25, entirely
+  in hover (fixes the rev-1.0 window artifact). Discriminator 0 ruled
+  **its own job**, not staged with the 1r run.
+- 2026-09-15b — **Campaign wave submitted (058 gsdiag5 + 052b 1r-ext25)**
+  from fresh worktrees `~/campaigns/052b058-20260915/` pinned by annotated
+  tags `campaign/{058-gsdiag5,052b-1r-ext25}-20260915` (pushed to all three
+  origins). KEY DESIGN: FLOWPanel pin = orc `unified-052` (4e6b5b7) +
+  cherry-picked `dd5573c` (as 1593dcd) + carrier commit b5ffa08 — NOT the
+  local `fastmultipole` branch, which has diverged ~1500 lines (026
+  in-flight work); this keeps discriminator 0 single-variable vs the
+  gsdiag2/4 baseline. FastMultipole 89ede6be / FLOWVPM 6c8cda4 = exact
+  gsdiag-era pins. Provenance:
+  `058-gsdiag5-provenance-2026-09-15.md`,
+  `052b-1r-ext25-provenance-2026-09-15.md`. First attempts (13705003/4)
+  FAILED on untracked `examples/data` mesh assets missing from the
+  worktree — fixed by symlinking from the live checkout; resubmitted as
+  **13711487 (gsdiag5) / 13711488 (1r-ext25)**, mgh/GH200.
+- 2026-09-15b — Residual definition pinned for 058 (Ryan asked): the
+  "normalized block residual" is max|φ(x_cp)| over control points via a
+  full influence! re-evaluation (self included) after each outer GS
+  iteration, normalization scales default 1 (FLOWPanel_solver.jl:2509-2537)
+  — a PHYSICAL BC residual through a DIFFERENT operator than the factored
+  G used by the block solve. Suspect ranking (unverified): (1) ±μ/2
+  self-potential jump convention G-vs-influence!, (2) Kutta/wake row
+  folding, (3) self-panel near-singular quadrature vs GPU batch kernel.
+  Cheap post-disc-0 probe: dump per-panel residual field, look at spatial
+  support (TE rows vs everywhere).
 
 
 ## Session results 2026-09-01c (verified, don't redo)
