@@ -136,7 +136,10 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
         self_matrices::Matrices{TF}, leaf_lu_cache;
         nworkers::Integer=Threads.nthreads(),
         idle_policy::Symbol=:spin,
-        coop::Integer=1) where TF
+        coop::Integer=1,
+        setup_diagnostics=nothing) where TF
+    # `setup_diagnostics` (optional Dict) records one-shot ctor-side stage
+    # timers (BRAINSTORM 033 B-I2); same idiom as the solve-time `diagnostics`
 
     precision in (:f64, :f32conv, :f32full) || throw(ArgumentError(
         "dagteam_precision must be :f64, :f32conv, or :f32full (got $(repr(precision)))"))
@@ -146,6 +149,8 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
     TS = precision === :f32full ? Float32 : TF
 
     n_leaves = length(source_tree.leaf_index)
+
+    t_stage = setup_diagnostics === nothing ? UInt64(0) : time_ns()
 
     #--- leaf geometry; strength rows must alias rhs rows ---#
 
@@ -190,6 +195,11 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
             "dagteam: duplicate direct block for leaf $i — overlapping target branches in the direct list"))
     end
 
+    if setup_diagnostics !== nothing
+        setup_diagnostics[:dagplan_edges_ns] = time_ns() - t_stage
+        t_stage = time_ns()
+    end
+
     #--- split storage + reduction map ---#
 
     ptot = [sum(nof(j) for j in preds[i]; init=0) for i in 1:n_leaves]
@@ -222,6 +232,11 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
         for (pos, i) in enumerate(uppers[j])
             push!(red[i], (j, upofs[j][pos]))
         end
+    end
+
+    if setup_diagnostics !== nothing
+        setup_diagnostics[:dagplan_alloc_ns] = time_ns() - t_stage
+        t_stage = time_ns()
     end
 
     # repack: tall-matrix rows follow index_map segment order; within a
@@ -265,6 +280,11 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
             "dagteam repack covered $r0 of $(size(mat, 1)) rows for source leaf $j"))
     end
 
+    if setup_diagnostics !== nothing
+        setup_diagnostics[:dagplan_repack_ns] = time_ns() - t_stage
+        t_stage = time_ns()
+    end
+
     #--- graph auxiliaries ---#
 
     nsucc = [Int[] for _ in 1:n_leaves]
@@ -281,6 +301,11 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
     end
     indeg0 = [length(preds[i]) for i in 1:n_leaves]
     roots = [i for i in 1:n_leaves if indeg0[i] == 0]
+
+    if setup_diagnostics !== nothing
+        setup_diagnostics[:dagplan_prio_ns] = time_ns() - t_stage
+        t_stage = time_ns()
+    end
 
     #--- state and scratch ---#
 
@@ -312,6 +337,11 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
         qb = Vector{TS}[]
     end
 
+    if setup_diagnostics !== nothing
+        setup_diagnostics[:dagplan_scratch_ns] = time_ns() - t_stage
+        t_stage = time_ns()
+    end
+
     if TS === TF
         leaf_lu_cache isa LeafLUCache || throw(ArgumentError(
             "sweep_order=:dagteam requires cache_leaf_lu=true"))
@@ -319,6 +349,9 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
     else
         lus = build_leaf_lu_cache_as(TS, self_matrices)
     end
+
+    setup_diagnostics === nothing ||
+        (setup_diagnostics[:dagplan_lu_ns] = time_ns() - t_stage)
 
     indeg = copy(indeg0)
     readyQ = Int[]; sizehint!(readyQ, n_leaves)
