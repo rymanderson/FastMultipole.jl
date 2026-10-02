@@ -294,8 +294,12 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
         return
     end
     if setup_threads >= 1
-        Threads.@threads :static for j in 1:n_leaves
-            repack_leaf!(j)
+        # one task per leaf: per-leaf repack cost is highly skewed (∝ the
+        # leaf's direct-list bytes), so static contiguous chunking load-
+        # imbalances badly (measured 1.5x at j64); dynamic per-leaf tasks
+        # let idle workers steal the tail
+        @sync for j in 1:n_leaves
+            Threads.@spawn repack_leaf!(j)
         end
     else
         for j in 1:n_leaves
