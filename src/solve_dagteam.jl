@@ -77,13 +77,19 @@ end
 # TS != TF; pivoting may differ from the TF factorization — the dagteam
 # iterate at reduced precision is certified by the independent evaluator,
 # not by bit comparison)
-function build_leaf_lu_cache_as(::Type{TS}, self_matrices::Matrices) where TS
+function build_leaf_lu_cache_as(::Type{TS}, self_matrices::Matrices;
+        setup_threads::Integer=0) where TS
     data = TS.(self_matrices.data)
-    factors = map(eachindex(self_matrices.sizes)) do k
+    factor_leaf = k -> begin
         m, n = self_matrices.sizes[k]
         matrix_range = get_matrix_range(self_matrices, k, m, n)
         lu!(reshape(view(data, matrix_range), m, n); check=true)
     end
+    # independent blocks, deterministic lu! → threaded build is bitwise-equal
+    # to the serial map (033 B-I2)
+    factors = setup_threads >= 1 ?
+        fetch.([Threads.@spawn factor_leaf(k) for k in eachindex(self_matrices.sizes)]) :
+        map(factor_leaf, eachindex(self_matrices.sizes))
     bytes = sizeof(data) + sum(sizeof(F.ipiv) for F in factors; init=0)
     return LeafLUCache{TS,eltype(factors)}(data, factors, 0.0, bytes)
 end
@@ -137,7 +143,10 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
         nworkers::Integer=Threads.nthreads(),
         idle_policy::Symbol=:spin,
         coop::Integer=1,
+        setup_threads::Integer=0,
         setup_diagnostics=nothing) where TF
+    # `setup_threads` >= 1 parallelizes the L/U repack over source leaves
+    # (033 B-I2; bitwise-identical, see the repack comment below); 0 = serial.
     # `setup_diagnostics` (optional Dict) records one-shot ctor-side stage
     # timers (BRAINSTORM 033 B-I2); same idiom as the solve-time `diagnostics`
 
@@ -241,12 +250,16 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
 
     # repack: tall-matrix rows follow index_map segment order; within a
     # segment, rows follow the branch's ascending global rows, i.e. whole
-    # leaves lo:hi in ascending order (asserted above)
-    for j in 1:n_leaves
+    # leaves lo:hi in ascending order (asserted above).
+    # Parallel over source leaves j is race-free and bitwise-identical to the
+    # serial pass (033 B-I2): iteration j writes only Umat[j] and, in each
+    # Lmat[i], the column block colofs-offset to j — regions disjoint across
+    # j — with pure elementwise converts (no accumulation, no shared scratch).
+    repack_leaf! = j -> begin
         # a source leaf with no direct blocks has nothing to repack; with an
         # entirely empty direct list, nonself_matrices is EmptyMatrices (no
         # per-leaf entries at all), so indexing it here would throw
-        isempty(index_map[j]) && continue
+        isempty(index_map[j]) && return
         mat, _ = get_matrix_vector(nonself_matrices, j)
         nj = nof(j)
         size(mat, 1) == 0 || size(mat, 2) == nj || throw(ArgumentError(
@@ -278,6 +291,16 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
         end
         r0 == size(mat, 1) || throw(ArgumentError(
             "dagteam repack covered $r0 of $(size(mat, 1)) rows for source leaf $j"))
+        return
+    end
+    if setup_threads >= 1
+        Threads.@threads :static for j in 1:n_leaves
+            repack_leaf!(j)
+        end
+    else
+        for j in 1:n_leaves
+            repack_leaf!(j)
+        end
     end
 
     if setup_diagnostics !== nothing
@@ -347,7 +370,7 @@ function build_dagteam_plan(precision::Symbol, nonself_matrices::Matrices{TF},
             "sweep_order=:dagteam requires cache_leaf_lu=true"))
         lus = leaf_lu_cache
     else
-        lus = build_leaf_lu_cache_as(TS, self_matrices)
+        lus = build_leaf_lu_cache_as(TS, self_matrices; setup_threads)
     end
 
     setup_diagnostics === nothing ||

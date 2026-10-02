@@ -69,10 +69,10 @@ function get_matrix_vector(ms::Matrices, k::Int)
     return reshape(mat, m, n), view(ms.rhs, vrange)
 end
 
-function build_leaf_lu_cache(self_matrices::Matrices{TF}) where TF
+function build_leaf_lu_cache(self_matrices::Matrices{TF}; setup_threads::Integer=0) where TF
     start_time = time_ns()
     data = copy(self_matrices.data)
-    factors = map(eachindex(self_matrices.sizes)) do k
+    factor_leaf = k -> begin
         m, n = self_matrices.sizes[k]
         m == n || throw(DimensionMismatch(
             "FastGaussSeidel self-influence block $k must be square, got $(m)×$(n)"))
@@ -80,6 +80,11 @@ function build_leaf_lu_cache(self_matrices::Matrices{TF}) where TF
         factor_matrix = reshape(view(data, matrix_range), m, n)
         lu!(factor_matrix; check=true)
     end
+    # blocks are independent and lu! is deterministic per block, so the
+    # threaded build is bitwise-identical to the serial map (033 B-I2)
+    factors = setup_threads >= 1 ?
+        fetch.([Threads.@spawn factor_leaf(k) for k in eachindex(self_matrices.sizes)]) :
+        map(factor_leaf, eachindex(self_matrices.sizes))
     build_time = (time_ns() - start_time) * 1e-9
     bytes = sizeof(data) + sum(sizeof(F.ipiv) for F in factors)
     return LeafLUCache{TF,eltype(factors)}(data, factors, build_time, bytes)
@@ -924,7 +929,7 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
     #--- build self-influence matrices ---#
 
     self_matrices = self_influence_matrices(target_tree.buffers, source_tree.buffers, source_systems, target_tree, source_tree, derivatives_switches; setup_threads)
-    leaf_lu_cache = cache_leaf_lu ? build_leaf_lu_cache(self_matrices) : nothing
+    leaf_lu_cache = cache_leaf_lu ? build_leaf_lu_cache(self_matrices; setup_threads) : nothing
 
     #--- source strength vector ---#
 
@@ -996,7 +1001,8 @@ function FastGaussSeidel(target_systems::Tuple, source_systems::Tuple;
             build_dagteam_plan(dagteam_precision, nonself_matrices,
                 sorted_list, index_map, source_tree, target_tree,
                 strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache;
-                nworkers, idle_policy=dagteam_idle, coop=dagteam_coop) :
+                nworkers, idle_policy=dagteam_idle, coop=dagteam_coop,
+                setup_threads) :
             build_dagedge_plan(dagteam_precision, nonself_matrices,
                 sorted_list, index_map, source_tree, target_tree,
                 strengths_by_leaf, targets_by_branch, self_matrices, leaf_lu_cache;
